@@ -80,15 +80,17 @@ else
     echo "[broker-mod] WARNING: selkies input_handler.py not found at $INPUT_HANDLER"
 fi
 
-# ── Input device name diagnostic ─────────────────────────────────────────────
+# ── Input device name diagnostic (DEBUG only) ────────────────────────────────
 # Log the kernel sysfs names for the selkies virtual joystick devices so we can
 # verify the SDL device name that Eden/Qt will see for controller mapping.
-echo "[broker-mod] Input device names (for SDL controller mapping):"
-for node in js0 js1 js2 js3; do
-    name_file="/sys/class/input/${node}/device/name"
-    if [ -f "$name_file" ]; then
-        echo "[broker-mod]   /dev/input/${node}: $(cat "$name_file")"
-    else
-        echo "[broker-mod]   /dev/input/${node}: sysfs name not found"
-    fi
-done
+if [ "${BROKER_LOG_LEVEL,,}" = "debug" ]; then
+    echo "[broker-mod] Input device names (for SDL controller mapping):"
+    for node in js0 js1 js2 js3; do
+        name_file="/sys/class/input/${node}/device/name"
+        if [ -f "$name_file" ]; then
+            echo "[broker-mod]   /dev/input/${node}: $(cat "$name_file")"
+        else
+            echo "[broker-mod]   /dev/input/${node}: sysfs name not found"
+        fi
+    done
+fi
