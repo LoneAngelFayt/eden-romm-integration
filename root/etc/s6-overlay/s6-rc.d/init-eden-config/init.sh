@@ -12,11 +12,14 @@ find "$XDG_RUNTIME_DIR" -name "wayland-*" -delete
 rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
 echo "[broker-mod] Cleaned up stale display sockets."
 
-# ── python3 availability ──────────────────────────────────────────────────────
-if ! command -v python3 &>/dev/null; then
-    echo "[broker-mod] Installing python3..."
-    apt-get update -qq && apt-get install -y -qq python3 \
-        || echo "[broker-mod] ERROR: failed to install python3"
+# ── python3 + wmctrl availability ────────────────────────────────────────────
+_need_apt=0
+command -v python3 &>/dev/null || _need_apt=1
+command -v wmctrl  &>/dev/null || _need_apt=1
+if [ "$_need_apt" = "1" ]; then
+    echo "[broker-mod] Installing missing packages (python3, wmctrl)..."
+    apt-get update -qq && apt-get install -y -qq python3 wmctrl \
+        || echo "[broker-mod] ERROR: apt-get install failed"
 fi
 
 # ── sudoers permission ────────────────────────────────────────────────────────

@@ -22,6 +22,35 @@ SECRET           = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT         = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 FULLSCREEN_DELAY = float(os.environ.get("FULLSCREEN_DELAY", "3.0"))
 
+# SDL controller mappings for the selkies virtual "Microsoft X-Box 360 pad".
+# GUID 000000004d6963726f736f6674205800 is the name-based SDL GUID Eden assigns
+# to this device.  These values are sourced from /defaults/qt-config.ini
+# shipped with the linuxserver/eden image.  The broker seeds them into the live
+# config whenever it detects keyboard engine mappings (which are the container
+# defaults when the volume config pre-dates the SDL defaults being added).
+_SDL_GUID = "000000004d6963726f736f6674205800"
+PLAYER_0_SDL_DEFAULTS: dict[str, str] = {
+    "player_0_button_a":        f'"engine:sdl,port:0,guid:{_SDL_GUID},button:1"',
+    "player_0_button_b":        f'"engine:sdl,port:0,guid:{_SDL_GUID},button:0"',
+    "player_0_button_x":        f'"engine:sdl,port:0,guid:{_SDL_GUID},button:3"',
+    "player_0_button_y":        f'"engine:sdl,port:0,guid:{_SDL_GUID},button:2"',
+    "player_0_button_lstick":   f'"engine:sdl,port:0,guid:{_SDL_GUID},button:9"',
+    "player_0_button_rstick":   f'"engine:sdl,port:0,guid:{_SDL_GUID},button:10"',
+    "player_0_button_l":        f'"engine:sdl,port:0,guid:{_SDL_GUID},button:4"',
+    "player_0_button_r":        f'"engine:sdl,port:0,guid:{_SDL_GUID},button:5"',
+    "player_0_button_zl":       f'"engine:sdl,port:0,guid:{_SDL_GUID},axis:2,threshold:0.500000,invert:+"',
+    "player_0_button_zr":       f'"engine:sdl,port:0,guid:{_SDL_GUID},axis:5,threshold:0.500000,invert:+"',
+    "player_0_button_plus":     f'"engine:sdl,port:0,guid:{_SDL_GUID},button:7"',
+    "player_0_button_minus":    f'"engine:sdl,port:0,guid:{_SDL_GUID},button:6"',
+    "player_0_button_dleft":    f'"engine:sdl,port:0,guid:{_SDL_GUID},hat:0,direction:left"',
+    "player_0_button_dup":      f'"engine:sdl,port:0,guid:{_SDL_GUID},hat:0,direction:up"',
+    "player_0_button_dright":   f'"engine:sdl,port:0,guid:{_SDL_GUID},hat:0,direction:right"',
+    "player_0_button_ddown":    f'"engine:sdl,port:0,guid:{_SDL_GUID},hat:0,direction:down"',
+    "player_0_button_home":     f'"engine:sdl,port:0,guid:{_SDL_GUID},button:8"',
+    "player_0_lstick":          f'"engine:sdl,port:0,guid:{_SDL_GUID},axis_x:0,axis_y:1,offset_x:-0.000000,offset_y:0.000000,invert_x:+,invert_y:+,deadzone:0.150000"',
+    "player_0_rstick":          f'"engine:sdl,port:0,guid:{_SDL_GUID},axis_x:3,axis_y:4,offset_x:-0.000000,offset_y:0.000000,invert_x:+,invert_y:+,deadzone:0.150000"',
+}
+
 # Eden (Nintendo Switch) does not support emulator-level save states.
 # The Switch's own save system is used instead — games save to NAND via the
 # normal in-game save menu.  The /save-state and /load-state endpoints return
@@ -159,6 +188,49 @@ def _patch_ini():
     except Exception as exc:
         log.error("_patch_ini: failed: %s", exc)
 
+    _seed_controller_config(ini_path)
+
+
+def _seed_controller_config(ini_path: Path) -> None:
+    """Replace keyboard engine mappings for player 0 with SDL defaults.
+
+    The linuxserver/eden container seeds /config/.config/eden/qt-config.ini
+    from /defaults/qt-config.ini only when the file does not yet exist.  If
+    the volume config was created by an older image version it will have
+    keyboard engine mappings.  This function repairs those on every launch so
+    controller input always works without manual UI configuration.
+    """
+    try:
+        text = ini_path.read_text()
+    except Exception as exc:
+        log.error("_seed_controller_config: cannot read %s: %s", ini_path, exc)
+        return
+
+    if "engine:keyboard" not in text:
+        log.debug("_seed_controller_config: already SDL engine, skipping")
+        return
+
+    lines = text.splitlines()
+    new_lines = []
+    replaced = 0
+    for line in lines:
+        stripped = line.strip()
+        seeded = False
+        for key, sdl_val in PLAYER_0_SDL_DEFAULTS.items():
+            if stripped.startswith(f"{key}=") and "engine:keyboard" in stripped:
+                new_lines.append(f"{key}={sdl_val}")
+                replaced += 1
+                seeded = True
+                break
+        if not seeded:
+            new_lines.append(line)
+
+    if replaced:
+        tmp = ini_path.with_suffix(".tmp")
+        tmp.write_text("\n".join(new_lines) + "\n")
+        tmp.replace(ini_path)
+        log.info("_seed_controller_config: replaced %d keyboard mapping(s) with SDL defaults", replaced)
+
 
 # ── xdotool helpers ───────────────────────────────────────────────────────────
 
@@ -200,19 +272,20 @@ def _trigger_fullscreen(launch_session_time: str) -> None:
         return
 
     win_id = ids[-1]
-    # Use windowstate rather than a key event — setting _NET_WM_STATE_FULLSCREEN
-    # via the WM avoids triggering an X11 input grab that would block selkies
-    # keyboard/gamepad injection.
+    # Use wmctrl to set _NET_WM_STATE_FULLSCREEN via the window manager.
+    # This avoids X11 key injection which can trigger input grabs and break
+    # selkies gamepad/keyboard delivery.
+    win_id_hex = hex(int(win_id))
     result = subprocess.run(
         ["sudo", "-u", "abc", "env",
          *[f"{k}={v}" for k, v in _XDOTOOL_ENV.items()],
-         "xdotool", "windowstate", "--add", "FULLSCREEN", win_id],
+         "wmctrl", "-i", "-r", win_id_hex, "-b", "add,fullscreen"],
         capture_output=True, text=True, timeout=5,
     )
     if result.returncode == 0:
-        log.info("Fullscreen set via windowstate (window %s)", win_id)
+        log.info("Fullscreen set via wmctrl (window %s)", win_id_hex)
     else:
-        log.warning("_trigger_fullscreen: xdotool windowstate failed: %s", result.stderr.strip())
+        log.warning("_trigger_fullscreen: wmctrl failed: %s", result.stderr.strip())
 
 
 def _kill_eden():
