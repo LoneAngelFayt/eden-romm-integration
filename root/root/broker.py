@@ -20,18 +20,12 @@ from threading import Thread, Lock
 PORT       = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET     = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT   = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
-SAVE_SLOT  = int(os.environ.get("SAVE_SLOT", "1"))      # default slot for save-and-exit (1–8)
-SSTATE_WAIT = float(os.environ.get("SSTATE_WAIT", "3.0"))  # seconds to wait after save key
 
-# Configurable xdotool key strings — verify against the running container.
-# Set BROKER_LOG_LEVEL=DEBUG and check Eden's Emulation → Hotkeys menu,
-# then override these defaults in your compose file.
-SAVE_STATE_KEY = os.environ.get("SAVE_STATE_KEY", "")   # e.g. "ctrl+F5"
-LOAD_STATE_KEY = os.environ.get("LOAD_STATE_KEY", "")   # e.g. "F5"
-# Comma-separated list of per-slot selection keys, one per slot (slots 1–8).
-# e.g. "ctrl+F1,ctrl+F2,ctrl+F3,ctrl+F4,ctrl+F5,ctrl+F6,ctrl+F7,ctrl+F8"
-_slot_keys_raw = os.environ.get("SLOT_KEYS", "")
-SLOT_KEYS: list[str] = [k.strip() for k in _slot_keys_raw.split(",") if k.strip()]
+# Eden (Nintendo Switch) does not support emulator-level save states.
+# The Switch's own save system is used instead — games save to NAND via the
+# normal in-game save menu.  The /save-state and /load-state endpoints return
+# 501 Not Implemented; /save-and-exit simply kills the game and returns to the
+# dashboard.
 
 # ENV passed to the Eden subprocess via sudo -u abc env.
 # DISPLAY=:0      — Xwayland under labwc (pixelflux compositor chain)
@@ -63,12 +57,11 @@ log = logging.getLogger("broker")
 
 _session_lock = Lock()
 _session: dict = {
-    "process":          None,
-    "rom_path":         None,
-    "rom_name":         None,
-    "started_at":       None,
-    "is_managed":       False,
-    "save_in_progress": False,
+    "process":    None,
+    "rom_path":   None,
+    "rom_name":   None,
+    "started_at": None,
+    "is_managed": False,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -112,11 +105,10 @@ def _patch_ini():
         return
 
     # Keys to patch: section → {key: value}.
-    # Actual key names are verified during first-run testing; update if needed.
     target = {
         "UI": {
             "confirmClose": "false",
-            "fullscreen": "true",
+            "fullscreen":   "true",
         },
     }
 
@@ -137,7 +129,6 @@ def _patch_ini():
                 for key, val in target[current_section].items():
                     if stripped.startswith(f"{key}\\") or stripped.startswith(f"{key}=") or stripped.startswith(f"{key} ="):
                         old = line
-                        # Qt INI uses "key\default=val" or "key=val" format
                         if "\\default=" in stripped:
                             new_line = f"{key}\\default={val}"
                         else:
@@ -174,6 +165,9 @@ def _kill_eden():
         _session["is_managed"] = False
         proc = _session["process"]
         _session["process"] = None
+        _session["rom_path"] = None
+        _session["rom_name"] = None
+        _session["started_at"] = None
 
     if proc is None or proc.poll() is not None:
         log.debug("_kill_eden: no running process to kill")
@@ -232,11 +226,7 @@ def _cleanup_stale_sockets():
 
 
 def _log_eden_output(proc):
-    """Read Eden stdout/stderr line-by-line and emit as [eden] DEBUG log entries.
-
-    Keeps the broker log self-contained — no separate journald/syslog needed.
-    Only active at DEBUG level; at INFO the subprocess output is discarded.
-    """
+    """Read Eden stdout/stderr line-by-line and emit as [eden] DEBUG log entries."""
     try:
         for raw in proc.stdout:
             line = raw.decode(errors="replace").rstrip()
@@ -247,11 +237,7 @@ def _log_eden_output(proc):
 
 
 def _launch_eden_internal(rom_path):
-    """Launch /usr/bin/eden as abc via sudo+env.
-
-    No --batch equivalent: the Qt event loop must stay alive for xdotool
-    input delivery and SDL gamepad polling to work.
-    """
+    """Launch /usr/bin/eden as abc via sudo+env."""
     cmd = [
         "sudo", "-u", "abc", "env",
         *[f"{k}={v}" for k, v in ENV.items()],
@@ -286,12 +272,7 @@ def _launch_eden_internal(rom_path):
 
 
 def _monitor_process(proc, start_time):
-    """On unexpected exit, relaunch the dashboard if the session is still managed.
-
-    Backs off for 5 s if Eden died almost immediately (< 5 s) to avoid a
-    tight crash loop. Normal kills (via _kill_eden) set is_managed=False first,
-    so this watcher is a no-op for intentional stops.
-    """
+    """On unexpected exit, relaunch the dashboard if the session is still managed."""
     proc.wait()
     exit_code = proc.returncode
     duration = time.monotonic() - start_time
@@ -327,186 +308,12 @@ def _launch_eden(rom_path):
     _kill_eden()
     _cleanup_stale_sockets()
     _patch_ini()
-    time.sleep(2)  # let killed process and sockets settle before re-launching
+    time.sleep(2)
     with _session_lock:
         _session["rom_path"] = rom_path
         _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
         _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     _launch_eden_internal(rom_path)
-
-# ── xdotool helpers ───────────────────────────────────────────────────────────
-
-# Minimal env for xdotool: needs DISPLAY and HOME for X11 auth.
-_XDOTOOL_ENV = {
-    "DISPLAY":         ":0",
-    "HOME":            "/config",
-    "USER":            "abc",
-    "XDG_RUNTIME_DIR": ENV["XDG_RUNTIME_DIR"],
-}
-
-
-def _xdotool_find_window() -> str | None:
-    """Return the X11 window ID for eden, or None if not found.
-
-    Searches by PID first (more precise); falls back to classname search
-    in case pgrep returns multiple pids or the window is not yet mapped.
-    """
-    try:
-        pids = subprocess.check_output(
-            ["pgrep", "-x", "eden"], text=True
-        ).split()
-        log.debug("_xdotool_find_window: pgrep found pids=%s", pids)
-    except subprocess.CalledProcessError:
-        log.error("_xdotool_find_window: eden process not found via pgrep")
-        return None
-
-    xdo_base = (
-        ["sudo", "-u", "abc", "env"]
-        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
-        + ["xdotool"]
-    )
-
-    for pid in pids:
-        cmd = xdo_base + ["search", "--onlyvisible", "--pid", pid]
-        log.debug("_xdotool_find_window: trying cmd=%s", " ".join(cmd))
-        try:
-            out = subprocess.check_output(cmd, text=True, timeout=5)
-            ids = out.strip().split()
-            log.debug("_xdotool_find_window: pid=%s window ids=%s", pid, ids)
-            if ids:
-                wid = ids[-1]
-                log.debug("_xdotool_find_window: selected window %s for pid %s", wid, pid)
-                return wid
-        except subprocess.CalledProcessError as exc:
-            log.debug("_xdotool_find_window: pid=%s search returned non-zero: %s", pid, exc)
-        except Exception as exc:
-            log.debug("_xdotool_find_window: pid=%s search failed: %s", pid, exc)
-
-    # Fallback: search by classname
-    cmd = xdo_base + ["search", "--onlyvisible", "--classname", "eden"]
-    log.debug("_xdotool_find_window: classname fallback cmd=%s", " ".join(cmd))
-    try:
-        out = subprocess.check_output(cmd, text=True, timeout=5)
-        ids = out.strip().split()
-        if ids:
-            wid = ids[-1]
-            log.debug("_xdotool_find_window: found window %s via classname", wid)
-            return wid
-        log.debug("_xdotool_find_window: classname search returned no windows")
-    except subprocess.CalledProcessError as exc:
-        log.debug("_xdotool_find_window: classname search returned non-zero: %s", exc)
-    except Exception as exc:
-        log.debug("_xdotool_find_window: classname search failed: %s", exc)
-
-    log.error("_xdotool_find_window: Eden window not found")
-    return None
-
-
-def _xdotool_key(wid: str, key: str) -> bool:
-    """Send a single key to the Eden window. Returns False on any error."""
-    cmd = (
-        ["sudo", "-u", "abc", "env"]
-        + [f"{k}={v}" for k, v in _XDOTOOL_ENV.items()]
-        + ["xdotool", "key", "--window", wid, key]
-    )
-    log.debug("_xdotool_key: cmd=%s", " ".join(cmd))
-    try:
-        result = subprocess.run(cmd, timeout=5, capture_output=True, text=True)
-        if result.returncode == 0:
-            log.debug("_xdotool_key: key=%r delivered to window %s", key, wid)
-            return True
-        log.error(
-            "_xdotool_key: key=%r failed (rc=%d) stdout=%r stderr=%r",
-            key, result.returncode, result.stdout, result.stderr,
-        )
-        return False
-    except Exception as exc:
-        log.error("_xdotool_key: key=%r exception: %s", key, exc)
-        return False
-
-
-def _xdotool_save_state(slot: int) -> bool:
-    """Save emulator state to slot (1–8) via configured xdotool hotkeys.
-
-    If SLOT_KEYS is configured and has an entry for this slot, sends the
-    slot-selection key first. Then sends SAVE_STATE_KEY. Waits SSTATE_WAIT
-    seconds for the write to complete.
-
-    Returns False if SAVE_STATE_KEY is not configured or key delivery fails.
-    """
-    if not SAVE_STATE_KEY:
-        log.error(
-            "_xdotool_save_state: SAVE_STATE_KEY is not set — "
-            "set it via the SAVE_STATE_KEY env var (check Eden's hotkey settings)"
-        )
-        return False
-
-    wid = _xdotool_find_window()
-    if wid is None:
-        return False
-
-    # Send slot-selection key if configured for this slot.
-    effective_slot = slot if 1 <= slot <= 8 else 1
-    if SLOT_KEYS and effective_slot <= len(SLOT_KEYS):
-        slot_key = SLOT_KEYS[effective_slot - 1]
-        log.debug("_xdotool_save_state: sending slot key %r for slot %d", slot_key, effective_slot)
-        if not _xdotool_key(wid, slot_key):
-            return False
-        time.sleep(0.1)  # brief pause so Eden registers the slot change
-
-    log.debug("_xdotool_save_state: sending save key %r (slot %d)", SAVE_STATE_KEY, effective_slot)
-    if not _xdotool_key(wid, SAVE_STATE_KEY):
-        return False
-
-    log.info(
-        "_xdotool_save_state: save key sent (slot %d, window %s) — waiting %.1fs",
-        effective_slot, wid, SSTATE_WAIT,
-    )
-    time.sleep(SSTATE_WAIT)
-    return True
-
-
-def _xdotool_load_state(slot: int) -> bool:
-    """Load emulator state from slot (1–8) via configured xdotool hotkeys.
-
-    Sends the slot-selection key (if SLOT_KEYS is configured) then LOAD_STATE_KEY.
-    Returns False if LOAD_STATE_KEY is not configured or key delivery fails.
-    """
-    if not LOAD_STATE_KEY:
-        log.error(
-            "_xdotool_load_state: LOAD_STATE_KEY is not set — "
-            "set it via the LOAD_STATE_KEY env var (check Eden's hotkey settings)"
-        )
-        return False
-
-    wid = _xdotool_find_window()
-    if wid is None:
-        return False
-
-    effective_slot = slot if 1 <= slot <= 8 else 1
-    if SLOT_KEYS and effective_slot <= len(SLOT_KEYS):
-        slot_key = SLOT_KEYS[effective_slot - 1]
-        log.debug("_xdotool_load_state: sending slot key %r for slot %d", slot_key, effective_slot)
-        if not _xdotool_key(wid, slot_key):
-            return False
-        time.sleep(0.1)
-
-    log.debug("_xdotool_load_state: sending load key %r (slot %d)", LOAD_STATE_KEY, effective_slot)
-    if not _xdotool_key(wid, LOAD_STATE_KEY):
-        return False
-
-    log.info(
-        "_xdotool_load_state: load key sent (slot %d, window %s)",
-        effective_slot, wid,
-    )
-    return True
-
-
-def _save_and_exit(slot: int) -> bool:
-    """Save emulator state then kill Eden. Returns True if save key was delivered."""
-    ok = _xdotool_save_state(slot)
-    _kill_eden()
-    return ok
 
 
 # ── PulseAudio helpers ────────────────────────────────────────────────────────
@@ -544,6 +351,7 @@ def _cleanup_sockets():
         log.info("Socket cleanup: selkies stopped, s6 will restart it shortly.")
     else:
         log.warning("Socket cleanup: selkies not found or already stopped.")
+
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
@@ -615,44 +423,33 @@ class BrokerHandler(BaseHTTPRequestHandler):
             return
 
         if self.path == "/save-and-exit":
+            # Eden does not support save states — just exit the game.
+            # The Switch's own in-game save system handles persistence.
             with _session_lock:
                 if _session["rom_path"] is None:
                     self._send_json(409, {"error": "no game is running"})
                     return
-                if _session["save_in_progress"]:
-                    self._send_json(409, {"error": "save already in progress"})
-                    return
-                _session["save_in_progress"] = True
             body = self._read_body()
-            slot = body.get("slot", SAVE_SLOT)
-            if not isinstance(slot, int) or not (1 <= slot <= 8):
-                with _session_lock:
-                    _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–8"})
-                return
             wait = body.get("wait", True)
+            log.info("save-and-exit: exiting game (no save state support)")
             if wait:
-                try:
-                    ok = _save_and_exit(slot)
-                finally:
-                    with _session_lock:
-                        _session["save_in_progress"] = False
-                if not ok:
-                    log.warning("save-and-exit: save key failed (slot %d) — killed anyway", slot)
-                self._send_json(200, {"status": "ok", "saved": ok, "slot": slot})
+                _kill_eden()
+                self._send_json(200, {"status": "ok", "saved": False})
                 Thread(target=_launch_eden, args=(None,), daemon=True).start()
             else:
-                def _bg(s):
-                    try:
-                        ok = _save_and_exit(s)
-                    finally:
-                        with _session_lock:
-                            _session["save_in_progress"] = False
-                    if not ok:
-                        log.warning("save-and-exit: save key failed (slot %d) — killed anyway", s)
+                def _bg():
+                    _kill_eden()
                     _launch_eden(None)
-                Thread(target=_bg, args=(slot,), daemon=True).start()
-                self._send_json(200, {"status": "queued", "slot": slot})
+                Thread(target=_bg, daemon=True).start()
+                self._send_json(200, {"status": "queued", "saved": False})
+            return
+
+        if self.path == "/save-state":
+            self._send_json(501, {"error": "save states are not supported by Eden"})
+            return
+
+        if self.path == "/load-state":
+            self._send_json(501, {"error": "save states are not supported by Eden"})
             return
 
         if self.path == "/volume":
@@ -684,61 +481,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "mute": mute_state})
             return
 
-        if self.path == "/save-state":
-            with _session_lock:
-                if _session["rom_path"] is None:
-                    self._send_json(409, {"error": "no game is running"})
-                    return
-                if _session["save_in_progress"]:
-                    self._send_json(409, {"error": "save already in progress"})
-                    return
-                _session["save_in_progress"] = True
-            body = self._read_body()
-            slot = body.get("slot", 1)
-            if not isinstance(slot, int) or not (1 <= slot <= 8):
-                with _session_lock:
-                    _session["save_in_progress"] = False
-                self._send_json(400, {"error": "slot must be 1–8"})
-                return
-
-            def _bg_save(s):
-                try:
-                    ok = _xdotool_save_state(s)
-                finally:
-                    with _session_lock:
-                        _session["save_in_progress"] = False
-                if not ok:
-                    log.warning("save-state: key delivery failed for slot %d", s)
-
-            Thread(target=_bg_save, args=(slot,), daemon=True).start()
-            self._send_json(200, {"status": "saving", "slot": slot})
-            return
-
-        if self.path == "/load-state":
-            with _session_lock:
-                if _session["rom_path"] is None:
-                    self._send_json(409, {"error": "no game is running"})
-                    return
-            body = self._read_body()
-            slot = body.get("slot", 1)
-            if not isinstance(slot, int) or not (1 <= slot <= 8):
-                self._send_json(400, {"error": "slot must be 1–8"})
-                return
-            ok = _xdotool_load_state(slot)
-            self._send_json(
-                200 if ok else 500,
-                {"status": "ok" if ok else "error", "loaded": ok, "slot": slot},
-            )
-            return
-
         if self.path != "/launch":
             self._send_json(404, {"error": "not found"})
             return
-
-        with _session_lock:
-            if _session["save_in_progress"]:
-                self._send_json(409, {"error": "save in progress"})
-                return
 
         body = self._read_body()
         raw_path = body.get("rom_path", "").strip()
@@ -789,13 +534,7 @@ def main():
     if not SECRET:
         log.warning("BROKER_SECRET is not set — all POST/DELETE endpoints are unauthenticated")
 
-    # Log startup config at DEBUG so failures are diagnosable without code changes.
-    redacted_env = {k: ("***" if k == "BROKER_SECRET" else v) for k, v in ENV.items()}
-    log.debug("Startup ENV: %s", redacted_env)
-    log.debug(
-        "Hotkeys — SAVE_STATE_KEY=%r  LOAD_STATE_KEY=%r  SLOT_KEYS=%r",
-        SAVE_STATE_KEY, LOAD_STATE_KEY, SLOT_KEYS,
-    )
+    log.debug("Startup ENV: %s", {k: ("***" if k == "BROKER_SECRET" else v) for k, v in ENV.items()})
 
     time.sleep(5)
 
