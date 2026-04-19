@@ -20,7 +20,7 @@ from threading import Thread, Lock
 PORT             = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET           = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT         = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
-FULLSCREEN_DELAY = float(os.environ.get("FULLSCREEN_DELAY", "8.0"))
+FULLSCREEN_DELAY = float(os.environ.get("FULLSCREEN_DELAY", "3.0"))
 
 # Eden (Nintendo Switch) does not support emulator-level save states.
 # The Switch's own save system is used instead — games save to NAND via the
