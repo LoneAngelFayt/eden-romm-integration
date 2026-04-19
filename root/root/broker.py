@@ -255,24 +255,15 @@ def _xdotool_find_window() -> list[str]:
     return result.stdout.strip().splitlines()
 
 
-def _is_fullscreen(win_id_hex: str) -> bool:
-    """Return True if the window currently has _NET_WM_STATE_FULLSCREEN set."""
-    result = subprocess.run(
-        ["sudo", "-u", "abc", "env",
-         *[f"{k}={v}" for k, v in _XDOTOOL_ENV.items()],
-         "xprop", "-id", win_id_hex, "_NET_WM_STATE"],
-        capture_output=True, text=True, timeout=5,
-    )
-    return "_NET_WM_STATE_FULLSCREEN" in result.stdout
-
-
 def _trigger_fullscreen(launch_session_time: str) -> None:
-    """Wait FULLSCREEN_DELAY seconds, then poll until fullscreen is confirmed.
+    """Wait FULLSCREEN_DELAY seconds then send F11 to enter fullscreen.
 
-    Eden resets the window state when the game finishes loading, so a single
-    wmctrl call can appear to succeed but then be overridden.  This function
-    retries every 2 seconds for up to 30 seconds total, verifying via xprop
-    that _NET_WM_STATE_FULLSCREEN is actually present before stopping.
+    Uses xdotool without --window so Eden's Qt event loop handles the toggle
+    natively (same path as pressing F11 through the browser stream), avoiding
+    the X11 input grab that targeting a window ID causes.
+
+    Only called for game launches — dashboard runs windowed intentionally.
+    Aborts silently if the session changes before the delay expires.
     """
     time.sleep(FULLSCREEN_DELAY)
 
@@ -281,65 +272,20 @@ def _trigger_fullscreen(launch_session_time: str) -> None:
             log.debug("_trigger_fullscreen: session changed, skipping")
             return
 
-    ids = _xdotool_find_window()
-    if not ids:
+    if not _xdotool_find_window():
         log.warning("_trigger_fullscreen: no Eden window found after %.1fs", FULLSCREEN_DELAY)
         return
 
-    win_id = ids[-1]
-    win_id_hex = hex(int(win_id))
-
-    # First attempt: xdotool key F11 (no --window) so Eden's Qt event loop
-    # handles the toggle natively — same path as pressing F11 through the
-    # browser stream.  Sending without --window avoids the X11 focus/grab that
-    # broke selkies input when we targeted the window ID directly.
-    xdotool_result = subprocess.run(
+    result = subprocess.run(
         ["sudo", "-u", "abc", "env",
          *[f"{k}={v}" for k, v in _XDOTOOL_ENV.items()],
          "xdotool", "key", "F11"],
         capture_output=True, text=True, timeout=5,
     )
-    if xdotool_result.returncode == 0:
-        time.sleep(1)
-        if _is_fullscreen(win_id_hex):
-            log.info("Fullscreen confirmed via xdotool F11 (window %s)", win_id_hex)
-            return
-        log.debug("_trigger_fullscreen: xdotool F11 sent but FULLSCREEN not confirmed, falling back to wmctrl")
+    if result.returncode == 0:
+        log.info("_trigger_fullscreen: F11 sent")
     else:
-        log.warning("_trigger_fullscreen: xdotool F11 failed: %s", xdotool_result.stderr.strip())
-
-    # Fallback: wmctrl polling loop.  Eden may reset the window state when the
-    # game finishes loading, so we retry every 2s for up to 30s total.
-    deadline = time.monotonic() + 30.0
-    attempt = 0
-    while time.monotonic() < deadline:
-        with _session_lock:
-            if _session["started_at"] != launch_session_time:
-                log.debug("_trigger_fullscreen: session changed during retry, stopping")
-                return
-
-        attempt += 1
-        result = subprocess.run(
-            ["sudo", "-u", "abc", "env",
-             *[f"{k}={v}" for k, v in _XDOTOOL_ENV.items()],
-             "wmctrl", "-i", "-r", win_id_hex, "-b", "add,fullscreen"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode != 0:
-            log.warning("_trigger_fullscreen: wmctrl failed (attempt %d): %s",
-                        attempt, result.stderr.strip())
-            time.sleep(2)
-            continue
-
-        if _is_fullscreen(win_id_hex):
-            log.info("Fullscreen confirmed via wmctrl (window %s, attempt %d)", win_id_hex, attempt)
-            return
-
-        log.debug("_trigger_fullscreen: wmctrl ok but FULLSCREEN not yet confirmed (attempt %d)", attempt)
-        time.sleep(2)
-
-    log.warning("_trigger_fullscreen: gave up after 30s — FULLSCREEN not confirmed for window %s",
-                win_id_hex)
+        log.warning("_trigger_fullscreen: xdotool failed: %s", result.stderr.strip())
 
 
 def _kill_eden():
