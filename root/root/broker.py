@@ -192,13 +192,14 @@ def _patch_ini():
 
 
 def _seed_controller_config(ini_path: Path) -> None:
-    """Replace keyboard engine mappings for player 0 with SDL defaults.
+    """Replace non-SDL player 0 input mappings with SDL defaults.
 
     The linuxserver/eden container seeds /config/.config/eden/qt-config.ini
     from /defaults/qt-config.ini only when the file does not yet exist.  If
     the volume config was created by an older image version it will have
-    keyboard engine mappings.  This function repairs those on every launch so
-    controller input always works without manual UI configuration.
+    keyboard-style engine mappings (engine:keyboard for buttons, or
+    engine:analog_from_button for analog sticks).  This function repairs
+    those on every launch so controller input always works.
     """
     try:
         text = ini_path.read_text()
@@ -206,7 +207,8 @@ def _seed_controller_config(ini_path: Path) -> None:
         log.error("_seed_controller_config: cannot read %s: %s", ini_path, exc)
         return
 
-    if "engine:keyboard" not in text:
+    non_sdl = ("engine:keyboard", "engine:analog_from_button")
+    if not any(e in text for e in non_sdl):
         log.debug("_seed_controller_config: already SDL engine, skipping")
         return
 
@@ -217,7 +219,7 @@ def _seed_controller_config(ini_path: Path) -> None:
         stripped = line.strip()
         seeded = False
         for key, sdl_val in PLAYER_0_SDL_DEFAULTS.items():
-            if stripped.startswith(f"{key}=") and "engine:keyboard" in stripped:
+            if stripped.startswith(f"{key}=") and "engine:sdl" not in stripped:
                 new_lines.append(f"{key}={sdl_val}")
                 replaced += 1
                 seeded = True
@@ -229,7 +231,7 @@ def _seed_controller_config(ini_path: Path) -> None:
         tmp = ini_path.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
         tmp.replace(ini_path)
-        log.info("_seed_controller_config: replaced %d keyboard mapping(s) with SDL defaults", replaced)
+        log.info("_seed_controller_config: replaced %d non-SDL mapping(s) with SDL defaults", replaced)
 
 
 # ── xdotool helpers ───────────────────────────────────────────────────────────
