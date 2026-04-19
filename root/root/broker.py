@@ -441,39 +441,11 @@ def _monitor_process(proc, start_time):
     _launch_eden(None)
 
 
-def _restart_selkies():
-    """Kill selkies so s6 restarts it, then wait for joystick sockets to reappear.
-
-    Called before each game launch to flush accumulated evdev client connections.
-    Phase-2 handlers from the previous Eden instance can become stuck when their
-    inner asyncio.Queue.get() never unblocks, preventing reader.at_eof() from
-    being checked.  Restarting selkies guarantees a clean slate.
-
-    The WebRTC stream will briefly reconnect (~2-3s); this is acceptable during
-    the game loading sequence.  Dashboard relaunches skip this to avoid
-    unnecessary stream disruption.
-    """
-    result = subprocess.run(["pkill", "-15", "-f", "selkies"], capture_output=True)
-    if result.returncode != 0:
-        log.debug("_restart_selkies: selkies not running, skipping")
-        return
-    log.info("_restart_selkies: killed selkies, waiting for s6 restart...")
-    deadline = time.monotonic() + 10.0
-    while time.monotonic() < deadline:
-        if glob.glob("/tmp/selkies_js*.sock"):
-            log.info("_restart_selkies: sockets ready")
-            return
-        time.sleep(0.5)
-    log.warning("_restart_selkies: timed out waiting for selkies sockets")
-
-
 def _launch_eden(rom_path):
     """Top-level launch: kill any running Eden, clean sockets, patch ini, launch."""
     _kill_eden()
     _drain_gamepad_sockets()
     _patch_ini()
-    if rom_path:
-        _restart_selkies()
     time.sleep(2)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with _session_lock:
