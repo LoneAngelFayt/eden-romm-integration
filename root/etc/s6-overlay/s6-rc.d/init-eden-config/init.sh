@@ -22,11 +22,6 @@ if [ "$_need_apt" = "1" ]; then
         || echo "[broker-mod] ERROR: apt-get install failed"
 fi
 
-# ── sudoers permission ────────────────────────────────────────────────────────
-# sudo requires mode 0440; the Docker COPY sets 0644.
-chmod 0440 /etc/sudoers.d/broker
-echo "[broker-mod] sudoers rule set."
-
 # ── Disable labwc autostart ───────────────────────────────────────────────────
 # Prevents eden from being launched a second time by the desktop session —
 # the broker manages the process lifecycle directly.
@@ -39,9 +34,12 @@ echo "[broker-mod] Disabled labwc autostart."
 # Glob over the python version so patches survive base-image upgrades that bump
 # e.g. python3.12 → python3.13.
 INPUT_HANDLER=$(compgen -G "/lsiopy/lib/python3.*/site-packages/selkies/input_handler.py" | head -1)
-INPUT_HANDLER="${INPUT_HANDLER:-/lsiopy/lib/python3.13/site-packages/selkies/input_handler.py}"
 
-if [ -f "$INPUT_HANDLER" ]; then
+if [ -z "$INPUT_HANDLER" ]; then
+    echo "[broker-mod] ERROR: selkies input_handler.py not found — Python version glob matched nothing."
+    echo "[broker-mod]   Expected: /lsiopy/lib/python3.*/site-packages/selkies/input_handler.py"
+    echo "[broker-mod]   Selkies patches will be skipped. Check base image Python version."
+elif [ -f "$INPUT_HANDLER" ]; then
     # Patch 1: Active EOF detection in the keep-alive loop.
     #
     # The phase-2 keep-alive loop in _handle_interposer_client is:
