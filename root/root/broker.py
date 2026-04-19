@@ -319,38 +319,47 @@ def _kill_eden():
         log.debug("_kill_eden: process already gone")
 
 
-def _cleanup_stale_sockets():
-    """Remove only unreachable selkies socket files.
+def _drain_gamepad_sockets():
+    """Send EOF to each selkies gamepad socket before launching a new session.
 
-    Does NOT send EOF — sending EOF disconnects the browser gamepad client,
-    which breaks input for the new Eden instance. The interposer reconnects to
-    existing live sockets automatically; we only clean up orphaned files.
+    The selkies input_handler has two phases per connection:
+      1. Sends config payload, awaits a 1-byte arch specifier from the client.
+      2. Keep-alive loop: while self.running and not writer.is_closing().
+
+    Connecting and immediately sending SHUT_WR causes readexactly(1) in phase 1
+    to raise IncompleteReadError — the handler exits and removes itself from the
+    active client list without ever entering phase 2.
+
+    Phase-2 handlers exit via the reader.at_eof() patch applied in init.sh.
+
+    Socket files that refuse connection are stale and are unlinked.
     """
     paths = sorted(
         glob.glob("/tmp/selkies_js*.sock") + glob.glob("/tmp/selkies_event*.sock")
     )
     if not paths:
-        log.debug("Socket cleanup: no gamepad sockets found.")
+        log.debug("Socket drain: no gamepad sockets found.")
         return
 
+    drained = 0
     removed = 0
     for path in paths:
         try:
             with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as s:
                 s.settimeout(0.3)
                 s.connect(path)
-            log.debug("Socket cleanup: %s is alive, leaving it.", path)
+                s.shutdown(_socket.SHUT_WR)
+            drained += 1
         except OSError:
             try:
                 os.unlink(path)
                 removed += 1
-                log.debug("Socket cleanup: removed stale socket %s", path)
             except OSError:
                 pass
 
     log.debug(
-        "Socket cleanup: removed %d stale socket(s) of %d total.",
-        removed, len(paths),
+        "Socket drain: sent EOF to %d socket(s), removed %d dead file(s) (of %d total).",
+        drained, removed, len(paths),
     )
 
 
@@ -435,7 +444,7 @@ def _monitor_process(proc, start_time):
 def _launch_eden(rom_path):
     """Top-level launch: kill any running Eden, clean sockets, patch ini, launch."""
     _kill_eden()
-    _cleanup_stale_sockets()
+    _drain_gamepad_sockets()
     _patch_ini()
     time.sleep(2)
     started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
