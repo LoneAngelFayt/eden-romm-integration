@@ -185,10 +185,9 @@ def _patch_ini():
         tmp.write_text("\n".join(new_lines) + "\n")
         tmp.replace(ini_path)
         log.info("_patch_ini: qt-config.ini patched")
+        _seed_controller_config(ini_path)
     except Exception as exc:
         log.error("_patch_ini: failed: %s", exc)
-
-    _seed_controller_config(ini_path)
 
 
 def _seed_controller_config(ini_path: Path) -> None:
@@ -542,12 +541,14 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     and _session["process"].poll() is None
                     and _session["rom_path"] is not None
                 )
-                snap = dict(_session) if active else {}
+                rom_path   = _session["rom_path"]   if active else None
+                rom_name   = _session["rom_name"]   if active else None
+                started_at = _session["started_at"] if active else None
             self._send_json(200, {
                 "active":     active,
-                "rom_path":   snap.get("rom_path")   if active else None,
-                "rom_name":   snap.get("rom_name")   if active else None,
-                "started_at": snap.get("started_at") if active else None,
+                "rom_path":   rom_path,
+                "rom_name":   rom_name,
+                "started_at": started_at,
             })
         else:
             self._send_json(404, {"error": "not found"})
@@ -680,10 +681,13 @@ def main():
     time.sleep(5)
 
     # Kill any stale Eden instance left from a previous broker run.
-    result = subprocess.run(["pkill", "-9", "-x", "eden"], capture_output=True)
+    # SIGTERM first (allows in-game saves to flush to NAND), SIGKILL only if needed.
+    result = subprocess.run(["pkill", "-15", "-x", "eden"], capture_output=True)
     if result.returncode == 0:
-        log.info("Killed stale eden instance(s) on startup.")
-        time.sleep(2)
+        log.info("Sent SIGTERM to stale eden instance(s) on startup.")
+        time.sleep(3)
+        subprocess.run(["pkill", "-9", "-x", "eden"], capture_output=True)
+        time.sleep(1)
 
     _patch_ini()
 
