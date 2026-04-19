@@ -200,16 +200,19 @@ def _trigger_fullscreen(launch_session_time: str) -> None:
         return
 
     win_id = ids[-1]
+    # Use windowstate rather than a key event — setting _NET_WM_STATE_FULLSCREEN
+    # via the WM avoids triggering an X11 input grab that would block selkies
+    # keyboard/gamepad injection.
     result = subprocess.run(
         ["sudo", "-u", "abc", "env",
          *[f"{k}={v}" for k, v in _XDOTOOL_ENV.items()],
-         "xdotool", "key", "--window", win_id, "F11"],
+         "xdotool", "windowstate", "--add", "FULLSCREEN", win_id],
         capture_output=True, text=True, timeout=5,
     )
     if result.returncode == 0:
-        log.info("Fullscreen triggered via F11 (window %s)", win_id)
+        log.info("Fullscreen set via windowstate (window %s)", win_id)
     else:
-        log.warning("_trigger_fullscreen: xdotool failed: %s", result.stderr.strip())
+        log.warning("_trigger_fullscreen: xdotool windowstate failed: %s", result.stderr.strip())
 
 
 def _kill_eden():
