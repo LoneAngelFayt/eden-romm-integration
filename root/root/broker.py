@@ -17,9 +17,10 @@ from threading import Thread, Lock
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
-PORT       = int(os.environ.get("BROKER_PORT", "8000"))
-SECRET     = os.environ.get("BROKER_SECRET", "")
-ROM_ROOT   = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
+PORT             = int(os.environ.get("BROKER_PORT", "8000"))
+SECRET           = os.environ.get("BROKER_SECRET", "")
+ROM_ROOT         = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
+FULLSCREEN_DELAY = float(os.environ.get("FULLSCREEN_DELAY", "8.0"))
 
 # Eden (Nintendo Switch) does not support emulator-level save states.
 # The Switch's own save system is used instead — games save to NAND via the
@@ -157,6 +158,58 @@ def _patch_ini():
         log.info("_patch_ini: qt-config.ini patched")
     except Exception as exc:
         log.error("_patch_ini: failed: %s", exc)
+
+
+# ── xdotool helpers ───────────────────────────────────────────────────────────
+
+_XDOTOOL_ENV = {
+    "DISPLAY":    ":0",
+    "XAUTHORITY": "/config/.Xauthority",
+}
+
+
+def _xdotool_find_window() -> list[str]:
+    """Return window IDs for all visible Eden windows."""
+    result = subprocess.run(
+        ["sudo", "-u", "abc", "env",
+         *[f"{k}={v}" for k, v in _XDOTOOL_ENV.items()],
+         "xdotool", "search", "--onlyvisible", "--classname", "eden"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if result.returncode != 0 or not result.stdout.strip():
+        return []
+    return result.stdout.strip().splitlines()
+
+
+def _trigger_fullscreen(launch_session_time: str) -> None:
+    """Wait FULLSCREEN_DELAY seconds, then press F11 to enter true fullscreen.
+
+    Aborts silently if the session has changed (different game launched or
+    game was stopped) before the delay expires.
+    """
+    time.sleep(FULLSCREEN_DELAY)
+
+    with _session_lock:
+        if _session["started_at"] != launch_session_time:
+            log.debug("_trigger_fullscreen: session changed, skipping F11")
+            return
+
+    ids = _xdotool_find_window()
+    if not ids:
+        log.warning("_trigger_fullscreen: no Eden window found after %.1fs", FULLSCREEN_DELAY)
+        return
+
+    win_id = ids[-1]
+    result = subprocess.run(
+        ["sudo", "-u", "abc", "env",
+         *[f"{k}={v}" for k, v in _XDOTOOL_ENV.items()],
+         "xdotool", "key", "--window", win_id, "F11"],
+        capture_output=True, text=True, timeout=5,
+    )
+    if result.returncode == 0:
+        log.info("Fullscreen triggered via F11 (window %s)", win_id)
+    else:
+        log.warning("_trigger_fullscreen: xdotool failed: %s", result.stderr.strip())
 
 
 def _kill_eden():
@@ -309,11 +362,14 @@ def _launch_eden(rom_path):
     _cleanup_stale_sockets()
     _patch_ini()
     time.sleep(2)
+    started_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     with _session_lock:
         _session["rom_path"] = rom_path
         _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
-        _session["started_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _session["started_at"] = started_at
     _launch_eden_internal(rom_path)
+    if rom_path:
+        Thread(target=_trigger_fullscreen, args=(started_at,), daemon=True).start()
 
 
 # ── PulseAudio helpers ────────────────────────────────────────────────────────
