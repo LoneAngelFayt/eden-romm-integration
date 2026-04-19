@@ -42,17 +42,60 @@ INPUT_HANDLER=$(compgen -G "/lsiopy/lib/python3.*/site-packages/selkies/input_ha
 INPUT_HANDLER="${INPUT_HANDLER:-/lsiopy/lib/python3.13/site-packages/selkies/input_handler.py}"
 
 if [ -f "$INPUT_HANDLER" ]; then
-    # Patch 1: EOF detection fix.
-    # Without this, idle gamepad sockets never detect client disconnection because
-    # asyncio buffers the EOF but writer.is_closing() never flips on Unix sockets.
-    if grep -q "reader.at_eof()" "$INPUT_HANDLER"; then
+    # Patch 1: Active EOF detection in the keep-alive loop.
+    #
+    # The phase-2 keep-alive loop in _handle_interposer_client is:
+    #
+    #   while self.running and not writer.is_closing():
+    #       await asyncio.sleep(0.1)
+    #
+    # writer.is_closing() never flips on Unix sockets when the remote end
+    # closes, so dead emulator connections accumulate indefinitely.
+    #
+    # The naive fix (adding `not reader.at_eof()` to the while condition)
+    # fails because at_eof() returns `self._eof AND not self._buffer`.
+    # If the interposer has buffered any data at exit, _buffer is non-empty
+    # and at_eof() stays False forever.
+    #
+    # The real fix: replace asyncio.sleep(0.1) with a short-timeout read.
+    # reader.read(1) returns b"" on EOF regardless of buffer state, so we
+    # detect emulator disconnect within one 0.1 s tick.
+    if grep -q "wait_for(reader.read(1)" "$INPUT_HANDLER"; then
         echo "[broker-mod] selkies input_handler.py EOF patch already applied."
     else
-        sed -i \
-            's/while self\.running and not writer\.is_closing():/while self.running and not writer.is_closing() and not reader.at_eof():/' \
-            "$INPUT_HANDLER" \
-            || echo "[broker-mod] ERROR: sed patch failed on input_handler.py"
-        echo "[broker-mod] Patched selkies input_handler.py EOF detection."
+        if python3 - "$INPUT_HANDLER" <<'PYEOF'
+import sys, pathlib
+p = pathlib.Path(sys.argv[1])
+text = p.read_text()
+# Handle both the original loop and any previously applied at_eof() variant.
+variants = [
+    '            while self.running and not writer.is_closing():\n                await asyncio.sleep(0.1) ',
+    '            while self.running and not writer.is_closing():\n                await asyncio.sleep(0.1)',
+    '            while self.running and not writer.is_closing() and not reader.at_eof():\n                await asyncio.sleep(0.1) ',
+    '            while self.running and not writer.is_closing() and not reader.at_eof():\n                await asyncio.sleep(0.1)',
+]
+new_loop = (
+    '            while self.running and not writer.is_closing():\n'
+    '                try:\n'
+    '                    _bdata = await asyncio.wait_for(reader.read(1), timeout=0.1)\n'
+    '                    if not _bdata:\n'
+    '                        break\n'
+    '                except asyncio.TimeoutError:\n'
+    '                    pass\n'
+    '                except Exception:\n'
+    '                    break'
+)
+for old in variants:
+    if old in text:
+        p.write_text(text.replace(old, new_loop, 1))
+        sys.exit(0)
+sys.exit(1)
+PYEOF
+        then
+            echo "[broker-mod] Patched selkies input_handler.py keep-alive loop (active EOF detection)."
+        else
+            echo "[broker-mod] ERROR: python patch failed on input_handler.py keep-alive loop"
+        fi
     fi
 
     # Patch 2: Silence the selkies_gamepad logger.
