@@ -11,7 +11,7 @@ import socket as _socket
 import subprocess
 import sys
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from threading import Thread, Lock
 
@@ -286,14 +286,26 @@ def _patch_ini():
             else:
                 new_lines.append(line)
 
-        # Append any keys not found in the existing file.
+        # Insert missing keys under their existing section header; only create
+        # the section if the file doesn't have it at all. Blindly appending a
+        # second [section] block at EOF works for QSettings but accumulates
+        # duplicate headers over time.
         for section, keys in target.items():
             missing = {k: v for k, v in keys.items() if k not in applied[section]}
-            if missing:
+            if not missing:
+                continue
+            header_idx = next(
+                (i for i, l in enumerate(new_lines) if l.strip() == f"[{section}]"),
+                None,
+            )
+            add_lines = [f"{k}={v}" for k, v in missing.items()]
+            if header_idx is None:
                 new_lines.append(f"[{section}]")
-                for k, v in missing.items():
-                    new_lines.append(f"{k}={v}")
-                    log.warning("_patch_ini: [%s] %s not found — appended", section, k)
+                new_lines.extend(add_lines)
+            else:
+                new_lines[header_idx + 1:header_idx + 1] = add_lines
+            for k in missing:
+                log.warning("_patch_ini: [%s] %s not found — inserted", section, k)
 
         tmp = ini_path.with_suffix(".tmp")
         tmp.write_text("\n".join(new_lines) + "\n")
@@ -409,12 +421,19 @@ def _trigger_fullscreen(launch_id: int) -> None:
         log.warning("_trigger_fullscreen: no Eden window found after %.1fs", FULLSCREEN_DELAY)
         return
 
-    result = subprocess.run(
-        ["sudo", "-u", "abc", "env",
-         *[f"{k}={v}" for k, v in _XDOTOOL_ENV.items()],
-         "xdotool", "key", "F11"],
-        capture_output=True, text=True, timeout=5,
-    )
+    try:
+        result = subprocess.run(
+            ["sudo", "-u", "abc", "env",
+             *[f"{k}={v}" for k, v in _XDOTOOL_ENV.items()],
+             "xdotool", "key", "F11"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("_trigger_fullscreen: xdotool timed out sending F11")
+        return
+    except OSError as exc:
+        log.warning("_trigger_fullscreen: xdotool failed to run: %s", exc)
+        return
     if result.returncode == 0:
         log.info("_trigger_fullscreen: F11 sent")
     else:
@@ -446,8 +465,11 @@ def _kill_eden():
         except subprocess.TimeoutExpired:
             log.warning("Eden did not exit after SIGTERM — sending SIGKILL")
             os.killpg(pgid, signal.SIGKILL)
-            proc.wait()
-            log.debug("_kill_eden: process killed with SIGKILL")
+            try:
+                proc.wait(timeout=10)
+                log.debug("_kill_eden: process killed with SIGKILL")
+            except subprocess.TimeoutExpired:
+                log.error("Eden did not exit after SIGKILL — giving up")
     except ProcessLookupError:
         log.debug("_kill_eden: process already gone")
 
@@ -641,10 +663,21 @@ _PACTL_CMD = [
 
 
 def _pactl(*args: str) -> subprocess.CompletedProcess:
-    """Run pactl as abc so it connects to abc's PulseAudio instance."""
+    """Run pactl as abc so it connects to abc's PulseAudio instance.
+
+    A hung or missing pactl is reported as a non-zero CompletedProcess (rather
+    than raising) so the /volume and /mute handlers return a 500 instead of
+    dropping the connection with an unhandled exception."""
     cmd = _PACTL_CMD + ["pactl"] + list(args)
     log.debug("_pactl: cmd=%s", " ".join(cmd))
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except subprocess.TimeoutExpired:
+        log.error("pactl timed out: %s", " ".join(args))
+        return subprocess.CompletedProcess(cmd, 124, "", "pactl timed out")
+    except OSError as exc:
+        log.error("pactl failed to run: %s", exc)
+        return subprocess.CompletedProcess(cmd, 127, "", str(exc))
 
 
 def _pactl_get_mute() -> bool | None:
@@ -694,7 +727,7 @@ class BrokerHandler(BaseHTTPRequestHandler):
 
     def _read_body(self) -> dict:
         try:
-            length = min(int(self.headers.get("Content-Length", 0)), 64 * 1024)
+            length = max(0, min(int(self.headers.get("Content-Length", 0)), 64 * 1024))
         except ValueError:
             length = 0
         if length == 0:
@@ -753,10 +786,9 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 self._send_json(200, {"status": "ok", "saved": False})
                 Thread(target=_launch_eden, args=(None,), daemon=True).start()
             else:
-                def _bg():
-                    _kill_eden()
-                    _launch_eden(None)
-                Thread(target=_bg, daemon=True).start()
+                # _launch_eden kills any running instance first, so no separate
+                # _kill_eden is needed here.
+                Thread(target=_launch_eden, args=(None,), daemon=True).start()
                 self._send_json(200, {"status": "queued", "saved": False})
             return
 
@@ -891,7 +923,10 @@ def main():
     # while no game is running.
     Thread(target=_launch_eden, args=(None,), daemon=True).start()
 
-    server = HTTPServer(("0.0.0.0", PORT), BrokerHandler)
+    # ThreadingHTTPServer: /save-and-exit with wait=true kills Eden inline (up
+    # to ~5s on a stubborn process); a single-threaded server would stall
+    # /health and /status for the duration. Session state is lock-protected.
+    server = ThreadingHTTPServer(("0.0.0.0", PORT), BrokerHandler)
     log.info("Eden broker listening on port %d", PORT)
     if SECRET:
         log.info("Shared secret auth enabled")
