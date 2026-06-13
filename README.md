@@ -2,7 +2,7 @@
 
 A [linuxserver Docker mod](https://docs.linuxserver.io/general/container-customization/#docker-mods) for [linuxserver/eden](https://github.com/linuxserver/docker-eden) that adds an HTTP broker for [RomM](https://github.com/rommapp/romm) streaming integration.
 
-Enables RomM to launch Nintendo Switch games in a remote streaming session, with full controller support, volume/mute control, and automatic fullscreen on launch.
+Launch Switch games from the RomM web UI and stream them in the browser. Controller input works via selkies, volume is adjustable, and games open fullscreen automatically.
 
 ## Features
 
@@ -172,9 +172,7 @@ Nintendo Switch games do not support emulator-level save states in Eden. Games s
 
 Each game launch+exit cycle leaves ~4 dead Unix socket connections in the selkies process (`ss -x | grep selkies_event`). The selkies asyncio event loop does not reliably clean up phase-2 connections from killed Eden instances despite the `wait_for(reader.read(1))` patch. The selkies `finally` block calls `writer.close()` correctly but scheduling is not guaranteed under load.
 
-**Impact:** At ~4 zombies per launch and a default fd limit of ~1024, controllers will break after roughly 250 game launches without a container restart.
-
-**Workaround:** Restart the container weekly (or on demand before hitting the limit). Add a weekly cron job or Docker healthcheck restart policy.
+At ~4 zombies per launch with a default fd limit of ~1024, controllers will stop working after roughly 250 launches without a restart. Restart the container weekly (or before you hit the limit) — a cron job or Docker healthcheck restart policy both work.
 
 ## RomM Integration
 
