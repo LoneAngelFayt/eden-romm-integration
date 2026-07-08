@@ -401,9 +401,11 @@ def _xdotool_find_window() -> str | None:
 def _trigger_fullscreen(launch_id: int) -> None:
     """Wait FULLSCREEN_DELAY seconds then send F11 to enter fullscreen.
 
-    Uses xdotool without --window so Eden's Qt event loop handles the toggle
-    natively (same path as pressing F11 through the browser stream), avoiding
-    the X11 input grab that targeting a window ID causes.
+    Activates the Eden window first, then sends F11 without --window so
+    Eden's Qt event loop handles the toggle natively (same path as pressing
+    F11 through the browser stream), avoiding the X11 input grab that
+    targeting a window ID causes. An untargeted key goes to the focused
+    window, so activation guarantees that window is Eden.
 
     Only called for game launches — dashboard runs windowed intentionally.
     Aborts (with a debug log) if a newer launch supersedes this one before
@@ -417,7 +419,8 @@ def _trigger_fullscreen(launch_id: int) -> None:
                       launch_id, _session["launch_id"])
             return
 
-    if not _xdotool_find_window():
+    window_id = _xdotool_find_window()
+    if not window_id:
         log.warning("_trigger_fullscreen: no Eden window found after %.1fs", FULLSCREEN_DELAY)
         return
 
@@ -425,7 +428,7 @@ def _trigger_fullscreen(launch_id: int) -> None:
         result = subprocess.run(
             ["sudo", "-u", "abc", "env",
              *[f"{k}={v}" for k, v in _XDOTOOL_ENV.items()],
-             "xdotool", "key", "F11"],
+             "xdotool", "windowactivate", "--sync", window_id, "key", "F11"],
             capture_output=True, text=True, timeout=5,
         )
     except subprocess.TimeoutExpired:
@@ -720,7 +723,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
-        self.send_header("Access-Control-Allow-Origin", "*")
         self.end_headers()
         self.wfile.write(payload)
         log.debug("HTTP response: %d %s", code, body)
@@ -741,6 +743,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
         log.debug("HTTP GET %s", self.path)
         if self.path == "/health":
             self._send_json(200, {"status": "ok"})
+        elif not self._check_secret():
+            # /health stays open for container healthchecks; all other GETs
+            # require the shared secret, matching POST/DELETE.
+            self._send_json(403, {"error": "forbidden"})
         elif self.path == "/status":
             with _session_lock:
                 active = (
@@ -866,13 +872,6 @@ class BrokerHandler(BaseHTTPRequestHandler):
         Thread(target=_launch_eden, args=(None,), daemon=True).start()
         log.info("Soft reset: returning to dashboard")
         self._send_json(200, {"status": "resetting"})
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Broker-Secret")
-        self.end_headers()
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
