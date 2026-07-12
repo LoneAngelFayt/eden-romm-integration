@@ -3,6 +3,7 @@
 
 import glob
 import hmac
+import io
 import json
 import logging
 import os
@@ -11,8 +12,9 @@ import socket as _socket
 import subprocess
 import sys
 import time
+import zipfile
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from threading import Thread, Lock
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -181,6 +183,150 @@ EDEN_LOG_PATH = Path(os.environ.get("EDEN_LOG_PATH", "/config/eden.log"))
 _EDEN_LOG_UID = int(os.environ.get("PUID", "1000"))
 _EDEN_LOG_GID = int(os.environ.get("PGID", "1000"))
 
+# ── In-game save sync ─────────────────────────────────────────────────────────
+# Eden has no save states, so RomM syncs the Switch's own NAND save data
+# instead: GET /save-file zips every save file modified since the last game
+# launch, PUT /save-file restores a previously pulled archive before launch.
+# Per-title dirs live under <data>/nand/user/save/0000000000000000/<uuid>/<tid>.
+#
+# The data dir is probed because the linuxserver image has shipped different
+# dir names across versions (same reasoning as the qt-config.ini candidates).
+_SAVE_DATA_ROOTS = (
+    Path("/config/.local/share/eden"),
+    Path("/config/.local/share/Eden"),
+    Path("/config/.local/share/yuzu"),
+)
+# Archive members must live under one of these root-relative subtrees; PUT
+# rejects anything else so a crafted zip cannot touch configs or keys.
+SAVE_SYNC_SUBTREES = ("nand/user/save",)
+SAVE_FILE_MAX_BYTES = 256 * 1024 * 1024
+# Zip stores mtimes at 2 s DOS resolution; the slack keeps the newer-file
+# guard from skipping files over rounding alone.
+_SAVE_MTIME_SLACK = 2.0
+
+
+def _save_data_root() -> Path | None:
+    """Return Eden's data dir, honouring a SAVE_DATA_ROOT override."""
+    env = os.environ.get("SAVE_DATA_ROOT")
+    if env:
+        return Path(env)
+    for c in _SAVE_DATA_ROOTS:
+        if c.is_dir():
+            return c
+    return None
+
+
+def _iter_save_files(root: Path) -> list[Path]:
+    """Every regular file under the allowed save subtrees, sorted for a
+    deterministic archive (identical content zips to identical bytes)."""
+    files: list[Path] = []
+    for sub in SAVE_SYNC_SUBTREES:
+        base = root / sub
+        if not base.is_dir():
+            continue
+        files.extend(
+            p for p in sorted(base.rglob("*")) if p.is_file() and not p.is_symlink()
+        )
+    return files
+
+
+def _build_save_archive(baseline: float) -> bytes | None:
+    """Zip every save file modified since the last game launch.
+
+    Returns None when there is nothing to sync — no data dir yet, or no file
+    changed since `baseline`. Member paths are relative to the data dir so a
+    later PUT restores them regardless of which candidate dir is live."""
+    root = _save_data_root()
+    if root is None:
+        log.debug("save-file: no Eden data dir found")
+        return None
+    changed: list[Path] = []
+    total = 0
+    for p in _iter_save_files(root):
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if st.st_mtime >= baseline:
+            changed.append(p)
+            total += st.st_size
+    if not changed:
+        return None
+    if total > SAVE_FILE_MAX_BYTES:
+        log.warning("save-file: changed saves exceed size limit (%d bytes)", total)
+        return None
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in changed:
+            try:
+                zf.write(p, p.relative_to(root).as_posix())
+            except OSError as exc:
+                log.warning("save-file: could not read %s — %s", p, exc)
+    return buf.getvalue()
+
+
+def _mkdirs_owned(path: Path) -> None:
+    """mkdir -p with abc ownership on every directory this call creates, so
+    Eden (running as abc) can keep writing saves inside them later."""
+    missing: list[Path] = []
+    cur = path
+    while not cur.exists():
+        missing.append(cur)
+        cur = cur.parent
+    path.mkdir(parents=True, exist_ok=True)
+    for d in reversed(missing):
+        try:
+            os.chown(d, _EDEN_LOG_UID, _EDEN_LOG_GID)
+        except OSError:
+            pass
+
+
+def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
+    """Restore a pulled save archive into the data dir.
+
+    Returns (written, skipped) on success, or an error string for a bad
+    archive. Existing files newer than their archive member are skipped so a
+    restore can never roll back saves made since the archive was taken."""
+    root = _save_data_root() or _SAVE_DATA_ROOTS[0]
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        return "body is not a zip archive"
+    with zf:
+        infos = [i for i in zf.infolist() if not i.is_dir()]
+        if sum(i.file_size for i in infos) > SAVE_FILE_MAX_BYTES:
+            return "archive exceeds size limit when extracted"
+        for info in infos:
+            member = PurePosixPath(info.filename)
+            if member.is_absolute() or ".." in member.parts:
+                return f"archive member escapes save dir: {info.filename}"
+            if not any(
+                member.as_posix().startswith(sub + "/") for sub in SAVE_SYNC_SUBTREES
+            ):
+                return f"archive member outside save subtrees: {info.filename}"
+
+        written = skipped = 0
+        for info in infos:
+            target = root / PurePosixPath(info.filename)
+            mtime = time.mktime(info.date_time + (0, 0, -1))
+            try:
+                if (
+                    target.exists()
+                    and target.stat().st_mtime > mtime + _SAVE_MTIME_SLACK
+                ):
+                    skipped += 1
+                    continue
+                _mkdirs_owned(target.parent)
+                tmp = target.parent / f".{target.name}.tmp"
+                tmp.write_bytes(zf.read(info))
+                os.chown(tmp, _EDEN_LOG_UID, _EDEN_LOG_GID)
+                os.replace(tmp, target)
+                os.utime(target, (mtime, mtime))
+            except OSError as exc:
+                return f"could not write {info.filename}: {exc}"
+            written += 1
+    return (written, skipped)
+
 # ── Session state ─────────────────────────────────────────────────────────────
 
 _session_lock = Lock()
@@ -194,6 +340,10 @@ _session: dict = {
     # timestamps with one-second resolution can collide across rapid
     # relaunches; a counter makes session-change detection unambiguous.
     "launch_id":  0,
+    # Wall-clock stamp of the last GAME launch (not dashboard relaunches).
+    # GET /save-file only ships files modified at or after this point; it
+    # survives game exit so RomM can still pull after the session ends.
+    "save_baseline": None,
 }
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -650,6 +800,10 @@ def _launch_eden(rom_path):
         _session["started_at"] = (
             time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) if rom_path else None
         )
+        # Dashboard relaunches keep the previous baseline so an end-of-session
+        # save pull still sees the files the last game wrote.
+        if rom_path:
+            _session["save_baseline"] = time.time()
     _launch_eden_internal(rom_path)
     if rom_path:
         Thread(target=_trigger_fullscreen, args=(launch_id,), daemon=True).start()
@@ -763,8 +917,57 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 "rom_name":   rom_name,
                 "started_at": started_at,
             })
+        elif self.path == "/save-file":
+            with _session_lock:
+                baseline = _session["save_baseline"]
+                rom_name = _session["rom_name"]
+            if baseline is None:
+                self._send_json(404, {"error": "no game has been launched"})
+                return
+            archive = _build_save_archive(baseline)
+            if archive is None:
+                self._send_json(404, {"error": "no save changes since last launch"})
+                return
+            # Header values must be latin-1; ROM stems can be anything.
+            safe_name = "".join(
+                c for c in (rom_name or "eden") if c.isascii() and c.isprintable()
+            ).strip() or "eden"
+            self.send_response(200)
+            self.send_header("Content-Type", "application/zip")
+            self.send_header("Content-Length", str(len(archive)))
+            self.send_header("X-Save-Filename", f"{safe_name}.saves.zip")
+            self.end_headers()
+            self.wfile.write(archive)
+            log.info("save-file: served archive (%d bytes)", len(archive))
         else:
             self._send_json(404, {"error": "not found"})
+
+    def do_PUT(self):
+        log.debug("HTTP PUT %s", self.path)
+        if not self._check_secret():
+            self._send_json(403, {"error": "forbidden"})
+            return
+        if self.path != "/save-file":
+            self._send_json(404, {"error": "not found"})
+            return
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except ValueError:
+            length = 0
+        if length <= 0:
+            self._send_json(400, {"error": "missing or empty body"})
+            return
+        if length > SAVE_FILE_MAX_BYTES:
+            self._send_json(413, {"error": "archive too large"})
+            return
+        content = self.rfile.read(length)
+        result = _extract_save_archive(content)
+        if isinstance(result, str):
+            self._send_json(400, {"error": result})
+            return
+        written, skipped = result
+        log.info("save-file: restored archive — %d written, %d skipped", written, skipped)
+        self._send_json(200, {"status": "ok", "written": written, "skipped": skipped})
 
     def do_POST(self):
         log.debug("HTTP POST %s", self.path)
