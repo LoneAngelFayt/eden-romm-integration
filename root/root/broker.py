@@ -445,7 +445,7 @@ def _patch_ini():
             if not missing:
                 continue
             header_idx = next(
-                (i for i, l in enumerate(new_lines) if l.strip() == f"[{section}]"),
+                (i for i, line in enumerate(new_lines) if line.strip() == f"[{section}]"),
                 None,
             )
             add_lines = [f"{k}={v}" for k, v in missing.items()]
