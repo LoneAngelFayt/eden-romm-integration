@@ -81,6 +81,27 @@ Launch a ROM. Eden is killed, sockets drained, ini patched, then the ROM is laun
 
 Returns `{"status": "launching", "rom_path": "..."}`.
 
+`rom_path` must exist and be under `ROM_ROOT`. It may be either a file or a
+**directory**, for libraries laid out one game per folder
+(`roms/switch/Metroid Dread/Metroid Dread.nsp`). RomM addresses such a game by
+its folder, because `Rom.full_path` is `fs_path/fs_name` and for a multi-file
+ROM `fs_name` is the directory, so the broker looks inside for the title: the
+folder itself first, then one level down. Candidates are ranked by format
+(`.xci`, `.nsp`, `.nca`, `.nro`, `.nso`, `.kip`, `.elf`) and then by name, so a
+cartridge dump wins over an eShop package and a real title wins over a homebrew
+`.nro` beside it. Dot-files are skipped, and a symlink pointing outside
+`ROM_ROOT` is never chosen. The resolved file is what `/status` and the
+response body report.
+
+A folder holding a base title alongside its updates and DLC is ambiguous: they
+share an extension, so name ordering decides, and no filename rule reliably
+tells a base `.nsp` from an update `.nsp`. Keep updates out of the game folder,
+or in a subfolder, to boot the base title.
+
+A directory with nothing bootable inside returns `422` with the accepted
+extensions in an `extensions` field, which is a different message from the
+`422` for a path that does not exist at all.
+
 ### `DELETE /launch`
 Stop the current game and return to the Eden dashboard.
 
