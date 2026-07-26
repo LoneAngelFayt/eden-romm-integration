@@ -85,13 +85,18 @@ Returns `{"status": "launching", "rom_path": "..."}`.
 **directory**, for libraries laid out one game per folder
 (`roms/switch/Metroid Dread/Metroid Dread.nsp`). RomM addresses such a game by
 its folder, because `Rom.full_path` is `fs_path/fs_name` and for a multi-file
-ROM `fs_name` is the directory, so the broker looks inside for the title: the
-folder itself first, then one level down. Candidates are ranked by format
-(`.xci`, `.nsp`, `.nca`, `.nro`, `.nso`, `.kip`, `.elf`) and then by name, so a
-cartridge dump wins over an eShop package and a real title wins over a homebrew
-`.nro` beside it. Dot-files are skipped, and a symlink pointing outside
-`ROM_ROOT` is never chosen. The resolved file is what `/status` and the
-response body report.
+ROM `fs_name` is the directory, so the broker looks inside for the title, in the
+folder itself and one level down. Everything found across both levels is ranked
+together by format (`.xci`, `.nsp`, `.nca`, `.nro`, `.nso`, `.kip`, `.elf`),
+then depth, then name. So a cartridge dump wins over an eShop package, and a
+real title wins over a homebrew `.nro` beside it or a level above it. Dot-files
+are skipped, and a symlink pointing outside `ROM_ROOT` is never chosen. The
+resolved file is what `/status` and the response body report.
+
+Ranking also reads a disc number off the name when one is there, which the
+Switch has no use for. It is kept because every broker shares one resolution
+algorithm, and an unmarked name counts as disc 1, so on this platform the rule
+never changes an outcome.
 
 A folder holding a base title alongside its updates and DLC is ambiguous: they
 share an extension, so name ordering decides, and no filename rule reliably
