@@ -2,7 +2,7 @@
 
 A [linuxserver Docker mod](https://docs.linuxserver.io/general/container-customization/#docker-mods) for [linuxserver/eden](https://github.com/linuxserver/docker-eden) that adds an HTTP broker for [RomM](https://github.com/rommapp/romm) streaming integration.
 
-Enables RomM to launch Nintendo Switch games in a remote streaming session, with full controller support, volume/mute control, and automatic fullscreen on launch.
+Launch Switch games from the RomM web UI and stream them in the browser. Controller input works via selkies, volume is adjustable, and games open fullscreen automatically.
 
 ## Features
 
@@ -80,6 +80,27 @@ Launch a ROM. Eden is killed, sockets drained, ini patched, then the ROM is laun
 ```
 
 Returns `{"status": "launching", "rom_path": "..."}`.
+
+`rom_path` must exist and be under `ROM_ROOT`. It may be either a file or a
+**directory**, for libraries laid out one game per folder
+(`roms/switch/Metroid Dread/Metroid Dread.nsp`). RomM addresses such a game by
+its folder, because `Rom.full_path` is `fs_path/fs_name` and for a multi-file
+ROM `fs_name` is the directory, so the broker looks inside for the title: the
+folder itself first, then one level down. Candidates are ranked by format
+(`.xci`, `.nsp`, `.nca`, `.nro`, `.nso`, `.kip`, `.elf`) and then by name, so a
+cartridge dump wins over an eShop package and a real title wins over a homebrew
+`.nro` beside it. Dot-files are skipped, and a symlink pointing outside
+`ROM_ROOT` is never chosen. The resolved file is what `/status` and the
+response body report.
+
+A folder holding a base title alongside its updates and DLC is ambiguous: they
+share an extension, so name ordering decides, and no filename rule reliably
+tells a base `.nsp` from an update `.nsp`. Keep updates out of the game folder,
+or in a subfolder, to boot the base title.
+
+A directory with nothing bootable inside returns `422` with the accepted
+extensions in an `extensions` field, which is a different message from the
+`422` for a path that does not exist at all.
 
 ### `DELETE /launch`
 Stop the current game and return to the Eden dashboard.
@@ -172,9 +193,7 @@ Nintendo Switch games do not support emulator-level save states in Eden. Games s
 
 Each game launch+exit cycle leaves ~4 dead Unix socket connections in the selkies process (`ss -x | grep selkies_event`). The selkies asyncio event loop does not reliably clean up phase-2 connections from killed Eden instances despite the `wait_for(reader.read(1))` patch. The selkies `finally` block calls `writer.close()` correctly but scheduling is not guaranteed under load.
 
-**Impact:** At ~4 zombies per launch and a default fd limit of ~1024, controllers will break after roughly 250 game launches without a container restart.
-
-**Workaround:** Restart the container weekly (or on demand before hitting the limit). Add a weekly cron job or Docker healthcheck restart policy.
+At ~4 zombies per launch with a default fd limit of ~1024, controllers will stop working after roughly 250 launches without a restart. Restart the container weekly (or before you hit the limit) — a cron job or Docker healthcheck restart policy both work.
 
 ## RomM Integration
 

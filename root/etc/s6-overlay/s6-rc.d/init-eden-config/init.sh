@@ -13,13 +13,23 @@ rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
 echo "[broker-mod] Cleaned up stale display sockets."
 
 # ── python3 + wmctrl availability ────────────────────────────────────────────
+# Both are runtime requirements: broker.py is python3, and wmctrl/xdotool are
+# used to drive Eden's window. apt-get failure here means broker.service will
+# fail to start (or fail at runtime) so we exit non-zero to surface it
+# immediately instead of letting the operator chase a confusing broker error.
 _need_apt=0
 command -v python3 &>/dev/null || _need_apt=1
 command -v wmctrl  &>/dev/null || _need_apt=1
 if [ "$_need_apt" = "1" ]; then
     echo "[broker-mod] Installing missing packages (python3, wmctrl)..."
-    apt-get update -qq && apt-get install -y -qq python3 wmctrl \
-        || echo "[broker-mod] ERROR: apt-get install failed"
+    if ! apt-get update -qq; then
+        echo "[broker-mod] FATAL: apt-get update failed — cannot install python3/wmctrl"
+        exit 1
+    fi
+    if ! apt-get install -y -qq python3 wmctrl; then
+        echo "[broker-mod] FATAL: apt-get install failed — broker cannot run without python3/wmctrl"
+        exit 1
+    fi
 fi
 
 # ── Disable labwc autostart ───────────────────────────────────────────────────
@@ -32,8 +42,20 @@ echo "[broker-mod] Disabled labwc autostart."
 
 # ── Selkies input_handler.py patches ─────────────────────────────────────────
 # Glob over the python version so patches survive base-image upgrades that bump
-# e.g. python3.12 → python3.13.
-INPUT_HANDLER=$(compgen -G "/lsiopy/lib/python3.*/site-packages/selkies/input_handler.py" | head -1)
+# e.g. python3.12 → python3.13. The linuxserver image only ever ships ONE
+# python3.X under /lsiopy, but we explicitly count matches and refuse to guess
+# if a future image starts shipping multiple — patching the wrong tree silently
+# would leave gamepad EOF detection broken.
+INPUT_HANDLER_MATCHES=$(compgen -G "/lsiopy/lib/python3.*/site-packages/selkies/input_handler.py" || true)
+INPUT_HANDLER_COUNT=$(printf '%s\n' "$INPUT_HANDLER_MATCHES" | sed '/^$/d' | wc -l)
+INPUT_HANDLER=$(printf '%s\n' "$INPUT_HANDLER_MATCHES" | sed '/^$/d' | head -1)
+
+if [ "$INPUT_HANDLER_COUNT" -gt 1 ]; then
+    echo "[broker-mod] ERROR: multiple selkies input_handler.py matches found:"
+    printf '%s\n' "$INPUT_HANDLER_MATCHES" | sed 's/^/[broker-mod]   /'
+    echo "[broker-mod]   Refusing to guess. Skipping patches; gamepad EOF detection may misbehave."
+    INPUT_HANDLER=""
+fi
 
 if [ -z "$INPUT_HANDLER" ]; then
     echo "[broker-mod] ERROR: selkies input_handler.py not found — Python version glob matched nothing."
