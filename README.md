@@ -28,7 +28,7 @@ services:
       - PUID=1000
       - PGID=1000
       - TZ=America/New_York
-      - DOCKER_MODS=ghcr.io/YOUR_USERNAME/eden-romm-integration-mod:latest
+      - DOCKER_MODS=ghcr.io/loneangelfayt/eden-romm-integration-mod:latest
       - BROKER_PORT=8000
       - BROKER_SECRET=your-secret-here
       - ROM_ROOT=/romm/library
@@ -38,7 +38,7 @@ services:
       - ./config:/config
       - /path/to/romm/library:/romm/library:ro
     ports:
-      - 3000:3000   # selkies WebRTC stream
+      - 3001:3001   # selkies https WebRTC stream
       - 8000:8000   # broker API (internal — proxy behind RomM, do not expose)
     restart: unless-stopped
 ```
