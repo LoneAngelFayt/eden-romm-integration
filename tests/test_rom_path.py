@@ -100,6 +100,15 @@ def test_resolve_rom_file_looks_one_level_into_subfolders(rom_root):
     assert broker._resolve_rom_file(rom_root / "switch" / "Game") == nsp
 
 
+def test_resolve_rom_file_ranks_a_nested_title_above_a_top_level_homebrew(rom_root):
+    """Format preference has to outrank shallowness. A homebrew .nro loose in
+    the game folder must not win just for sitting a level above the real title,
+    which folder-organized sets keep in a Base/ subfolder."""
+    xci = _rom(rom_root, "switch/Game/Base/Game.xci")
+    _rom(rom_root, "switch/Game/hbmenu.nro")
+    assert broker._resolve_rom_file(rom_root / "switch" / "Game") == xci
+
+
 def test_resolve_rom_file_prefers_the_top_level_title_over_a_nested_one(rom_root):
     top = _rom(rom_root, "switch/Game/Game.nsp")
     _rom(rom_root, "switch/Game/updates/Game (v1.1).nsp")
