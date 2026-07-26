@@ -155,13 +155,45 @@ def _wait_for_x_display(timeout: float = 30.0) -> str | None:
 # LD_PRELOAD      — joystick interposer redirects /dev/input/* opens to selkies
 #                   sockets; libudev.so.1.0.0-fake is intentionally excluded —
 #                   it intercepts Mesa/DRI udev calls and causes a black screen.
+# sudo's default env_reset drops everything the container was started with, so
+# only the names spelled out on the `env` line survive the hop. Every renderer
+# knob an operator sets in docker-compose — VK_DRIVER_FILES,
+# __GLX_VENDOR_LIBRARY_NAME, MESA_VK_DEVICE_SELECT — was silently discarded
+# before it could take effect. Forward the vendor namespaces wholesale rather
+# than an exact list so a knob we haven't heard of still arrives.
+_GPU_ENV_PREFIXES = (
+    "NVIDIA_", "VK_", "MESA_", "LIBGL_", "GALLIUM_", "RADV_", "AMD_",
+    "DRI_", "LIBVA_", "VDPAU_", "__GLX_", "__NV_", "__EGL_", "__VK_",
+)
+# XDG_DATA_DIRS is not a GPU knob, but the Vulkan loader searches it for
+# icd.d/ — dropping it hides ICDs installed outside /usr/share. DRINODE is the
+# linuxserver base image's render-node selector, which misses the DRI_ prefix.
+_GPU_ENV_NAMES = ("XDG_DATA_DIRS", "DRINODE")
+
+
+def _gpu_env() -> dict[str, str]:
+    """Graphics-related variables inherited from the container environment.
+
+    Empty values are skipped: `env VAR=` sets the variable to the empty string,
+    which for the likes of LIBGL_ALWAYS_SOFTWARE reads as set-and-false to some
+    consumers and set-and-true to others. DRI_NODE and DRINODE used to be
+    forwarded unconditionally this way, putting `DRINODE=` on every launch even
+    when the operator had never set it."""
+    return {
+        k: v for k, v in os.environ.items()
+        if v and (k.startswith(_GPU_ENV_PREFIXES) or k in _GPU_ENV_NAMES)
+    }
+
+
 ENV = {
+    # Inherited GPU vars come first so the computed entries below always win —
+    # DISPLAY is derived from live container state and must not be shadowed by
+    # a stale value from the container environment.
+    **_gpu_env(),
     "DISPLAY":            _detect_display(),
     "WAYLAND_DISPLAY":    _detect_wayland_display(),
     "XDG_RUNTIME_DIR":    XDG_RUNTIME_DIR,
     "PULSE_RUNTIME_PATH": "/defaults",
-    "DRI_NODE":           os.environ.get("DRI_NODE", ""),
-    "DRINODE":            os.environ.get("DRINODE", ""),
     "HOME":               "/config",
     "USER":               "abc",
     "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so",
@@ -174,6 +206,20 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("broker")
+
+# Report the forwarded GPU environment at startup. Renderer complaints almost
+# always begin with "my env vars aren't taking effect", and this line answers
+# that question from the broker log without a shell in the container.
+_forwarded_gpu = sorted(_gpu_env())
+if _forwarded_gpu:
+    log.info("Forwarding GPU environment to Eden: %s", ", ".join(_forwarded_gpu))
+else:
+    log.info(
+        "No GPU environment variables found to forward. If the renderer falls back to "
+        "llvmpipe, run `vulkaninfo --summary` in the container: NVIDIA absent means the "
+        "ICD was never injected (check NVIDIA_DRIVER_CAPABILITIES includes 'graphics'); "
+        "NVIDIA present means the failure is at surface creation instead."
+    )
 
 # Eden's stdout/stderr is captured to this file so renderer/Vulkan/Qt errors
 # are visible after the fact, regardless of broker log level. /config is the
