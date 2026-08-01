@@ -160,3 +160,137 @@ if [ "${BROKER_LOG_LEVEL,,}" = "debug" ]; then
         fi
     done
 fi
+
+# ── nginx stream gate ────────────────────────────────────────────────────────
+# Gate the browser-facing stream with nginx auth_request. The 3001 SSL vhost is
+# the host RomM loads in the iframe; without this, anyone who learns the address
+# gets an interactive desktop with the ROM library mounted, since RomM's auth
+# never sits on this socket. auth_request sends every 3001 request to the
+# broker's /verify, which checks the session-bound stream token RomM appends to
+# the iframe URL and, on the first (query-token) hit, hands back a stream_sid
+# cookie that carries every later asset and the WebSocket upgrade. Anchored on
+# ssl_certificate_key, which appears only in the 3001 server block, so the plain
+# 3000 vhost is untouched. The broker exempts /verify from its shared secret
+# because nginx cannot forward that secret and the stream token is the credential.
+#
+# Two base-image behaviours dictate the shape of this:
+#
+#   1. init-nginx re-copies /defaults/default.conf over the live vhost on every
+#      container start, and s6 gives us no ordering edge to it: init-eden-config
+#      hangs off init-config, init-nginx off init-selkies — separate branches
+#      under init-os-end, brought up concurrently. Patching only the live file is
+#      a coin flip, and losing the race means that cp silently wipes the gate and
+#      the stream comes up unauthenticated. So the template is the primary
+#      target; the live file is patched too, for the case where the cp already
+#      happened. Writing via a temp file and mv means a concurrent cp reads
+#      either the old template or the new one, never a half-written one.
+#
+#   2. When PASSWORD is set, init-nginx runs `sed -i 's/#//g'` over the config to
+#      uncomment its auth_basic lines. That strips every '#' in the file, so a
+#      comment injected here would become a bare invalid directive and stop nginx
+#      from starting. Nothing written into the config may contain a '#' — hence
+#      the idempotency marker is the _stream_auth location name, not a comment.
+#
+# Set-Cookie is added with `always` so it survives the 101 on the WebSocket
+# upgrade. It is set at server level, which the stream's own locations inherit
+# because they declare no add_header of their own.
+NGINX_TEMPLATE="/defaults/default.conf"
+NGINX_SITE="/etc/nginx/sites-available/default"
+# Must track broker.py's BROKER_PORT — the gate proxies to the broker's /verify,
+# and pointing it at the wrong port turns every stream request into a 500.
+#
+# This value is interpolated straight into a proxy_pass directive, so a typo
+# would write nginx a config it refuses to parse — and on a fresh container the
+# live vhost does not exist yet, so _validate_nginx below never runs to catch
+# it. A non-numeric port would stop the broker too (broker.py int()s it), but
+# there the blast radius is one service; here it is nginx, and with nginx down
+# there is no stream at all. Fall back to the default and say so.
+_broker_port="${BROKER_PORT:-8000}"
+_port_fault=""
+case "$_broker_port" in
+    ''|*[!0-9]*) _port_fault="not a number" ;;
+    # The length test comes first and short-circuits: `[ -lt ]` errors out on
+    # anything wider than a machine integer, and an errored test is a false one,
+    # which would let the bad value straight through.
+    *) [ "${#_broker_port}" -gt 5 ] || [ "$_broker_port" -lt 1 ] || [ "$_broker_port" -gt 65535 ] \
+        && _port_fault="out of range" ;;
+esac
+if [ -n "$_port_fault" ]; then
+    echo "[broker-mod] WARNING: BROKER_PORT='${_broker_port}' is ${_port_fault}; stream gate will use 8000."
+    _broker_port=8000
+fi
+
+# Writes the gated config to stdout; exits non-zero if the anchor is missing.
+_inject_stream_gate() {
+    awk -v port="$_broker_port" '
+      { print }
+      /ssl_certificate_key/ && !injected {
+        print "  auth_request /_stream_auth;"
+        print "  auth_request_set $stream_set_cookie $upstream_http_set_cookie;"
+        print "  add_header Set-Cookie $stream_set_cookie always;"
+        print "  location = /_stream_auth {"
+        print "    internal;"
+        print "    auth_request off;"
+        print "    proxy_pass http://127.0.0.1:" port "/verify;"
+        print "    proxy_pass_request_body off;"
+        print "    proxy_set_header Content-Length \"\";"
+        print "    proxy_set_header X-Original-URI $request_uri;"
+        print "  }"
+        injected = 1
+      }
+      END { exit !injected }
+    ' "$1"
+}
+
+_patch_stream_gate() {
+    local target="$1"
+    if grep -q "_stream_auth" "$target"; then
+        # Already gated — but /defaults lives in the image layer and survives a
+        # `docker restart`, so an operator who changed BROKER_PORT would
+        # otherwise keep the old port forever. Re-point it every time.
+        sed -i \
+            "s|proxy_pass http://127.0.0.1:[0-9]*/verify;|proxy_pass http://127.0.0.1:${_broker_port}/verify;|" \
+            "$target"
+        echo "[broker-mod] nginx stream gate already present in $target (broker port ${_broker_port})."
+        return 0
+    fi
+    if ! _inject_stream_gate "$target" > "$target.tmp"; then
+        rm -f "$target.tmp"
+        echo "[broker-mod] ERROR: no ssl_certificate_key anchor in $target (base image may have changed)."
+        return 1
+    fi
+    mv "$target.tmp" "$target"
+    echo "[broker-mod] Applied nginx stream gate to $target (broker port ${_broker_port})."
+}
+
+# nginx -t exits non-zero whether the config is malformed or the SSL cert simply
+# does not exist yet — init-nginx generates that cert and may not have run. The
+# messages differ, though, and nginx aborts on the first [emerg]: if the only
+# complaint is the certificate, everything before it — including the injection —
+# parsed clean. Anything else is a config this mod broke.
+_validate_nginx() {
+    local out rc
+    out="$(nginx -t 2>&1)"
+    rc=$?
+    if [ "$rc" = "0" ] || echo "$out" | grep -q "cannot load certificate"; then
+        return 0
+    fi
+    echo "[broker-mod] ERROR: nginx rejects the config after the stream gate injection:"
+    echo "$out" | sed 's/^/[broker-mod]   /'
+    return 1
+}
+
+_gate_applied=0
+if [ -f "$NGINX_TEMPLATE" ]; then
+    _patch_stream_gate "$NGINX_TEMPLATE" && _gate_applied=1
+else
+    echo "[broker-mod] WARNING: nginx template not found at $NGINX_TEMPLATE"
+fi
+if [ -f "$NGINX_SITE" ]; then
+    # Only the live config is testable: the template still holds init-nginx's
+    # unsubstituted placeholders (SUBFOLDER, CWS), which are not valid nginx.
+    _patch_stream_gate "$NGINX_SITE" && _gate_applied=1 && _validate_nginx
+fi
+if [ "$_gate_applied" = "0" ]; then
+    echo "[broker-mod] ERROR: stream gate applied to no nginx config — the 3001 stream will be UNAUTHENTICATED."
+fi
