@@ -6,8 +6,6 @@ mounted. nginx sends every 3001 request to /verify as an auth_request
 subrequest; the broker admits only requests carrying the live session token.
 """
 
-from http.cookies import SimpleCookie
-
 import broker
 from conftest import request, rom
 
@@ -42,9 +40,12 @@ def test_the_query_token_is_admitted_and_bootstraps_a_cookie():
     status, set_cookie = _decision(f"/?stream_token={token}")
     assert status == 200
     assert set_cookie is not None
-    jar = SimpleCookie()
-    jar.load(set_cookie)
-    assert jar["stream_sid"].value == token
+    # Split by hand rather than parsing with SimpleCookie: `Partitioned` only
+    # entered the stdlib's attribute table in 3.14, and an older parser drops
+    # the whole morsel when it meets an attribute it does not recognise. What
+    # matters is the header the browser receives, so assert on that directly.
+    name, _, value = set_cookie.split(";", 1)[0].partition("=")
+    assert (name, value) == ("stream_sid", token)
 
 
 def test_the_bootstrap_cookie_survives_a_cross_site_iframe():
