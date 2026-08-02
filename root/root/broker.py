@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """broker.py — launch Eden on demand and expose a small HTTP API."""
 
+import calendar
 import glob
 import hmac
 import io
@@ -8,6 +9,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import signal
 import socket as _socket
 import subprocess
@@ -15,9 +17,11 @@ import sys
 import time
 import zipfile
 from collections.abc import Iterable
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path, PurePosixPath
 from threading import Thread, Lock
+from urllib.parse import parse_qs, urlparse
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
@@ -25,6 +29,10 @@ PORT             = int(os.environ.get("BROKER_PORT", "8000"))
 SECRET           = os.environ.get("BROKER_SECRET", "")
 ROM_ROOT         = Path(os.environ.get("ROM_ROOT", "/romm/library")).resolve()
 FULLSCREEN_DELAY = float(os.environ.get("FULLSCREEN_DELAY", "3.0"))
+
+# JSON request bodies are tiny (a rom_path, a mute flag); anything larger is
+# rejected with 413 rather than silently truncated.
+_BODY_MAX_BYTES = 64 * 1024
 
 # SDL controller mappings for the selkies virtual "Microsoft X-Box 360 pad".
 # GUID 000000004d6963726f736f6674205800 is the name-based SDL GUID Eden assigns
@@ -148,6 +156,7 @@ def _wait_for_x_display(timeout: float = 30.0) -> str | None:
     return None
 
 
+# Eden is launched through `sudo -u abc env K=V ...`, and sudo's default
 # ENV passed to the Eden subprocess via sudo -u abc env.
 # DISPLAY        — detected at runtime (Xwayland may land on :1 if /tmp lock
 #                  files persist across container restarts on Podman).
@@ -155,13 +164,49 @@ def _wait_for_x_display(timeout: float = 30.0) -> str | None:
 # LD_PRELOAD      — joystick interposer redirects /dev/input/* opens to selkies
 #                   sockets; libudev.so.1.0.0-fake is intentionally excluded —
 #                   it intercepts Mesa/DRI udev calls and causes a black screen.
+# sudo's default env_reset drops everything the container was started with, so
+# only the names spelled out on the `env` line survive the hop. Every renderer
+# knob an operator sets in docker-compose — VK_DRIVER_FILES,
+# __GLX_VENDOR_LIBRARY_NAME, MESA_VK_DEVICE_SELECT — was silently discarded
+# before it could take effect. Forward the vendor namespaces wholesale rather
+# than an exact list so a knob we haven't heard of still arrives.
+_GPU_ENV_PREFIXES = (
+    "NVIDIA_", "VK_", "MESA_", "LIBGL_", "GALLIUM_", "RADV_", "AMD_",
+    "DRI_", "LIBVA_", "VDPAU_", "__GLX_", "__NV_", "__EGL_", "__VK_",
+)
+# XDG_DATA_DIRS is not a GPU knob, but the Vulkan loader searches it for
+# icd.d/ — dropping it hides ICDs installed outside /usr/share. DRINODE is the
+# linuxserver base image's render-node selector, which misses the DRI_ prefix.
+_GPU_ENV_NAMES = ("XDG_DATA_DIRS", "DRINODE")
+
+
+def _gpu_env() -> dict[str, str]:
+    """Graphics-related variables inherited from the container environment.
+
+    Empty values are skipped: `env VAR=` sets the variable to the empty string,
+    which for the likes of LIBGL_ALWAYS_SOFTWARE reads as set-and-false to some
+    consumers and set-and-true to others. DRI_NODE and DRINODE used to be
+    forwarded unconditionally this way, putting `DRINODE=` on every launch even
+    when the operator had never set it."""
+    return {
+        k: v for k, v in os.environ.items()
+        if v and (k.startswith(_GPU_ENV_PREFIXES) or k in _GPU_ENV_NAMES)
+    }
+
+
+# Captured once: what goes into ENV below and what gets logged at startup have
+# to be the same set, or the log answers a question nobody asked.
+GPU_ENV = _gpu_env()
+
 ENV = {
+    # Inherited GPU vars come first so the computed entries below always win:
+    # DISPLAY and LD_PRELOAD are derived from live container state and must not
+    # be shadowed by a stale value from the container environment.
+    **GPU_ENV,
     "DISPLAY":            _detect_display(),
     "WAYLAND_DISPLAY":    _detect_wayland_display(),
     "XDG_RUNTIME_DIR":    XDG_RUNTIME_DIR,
     "PULSE_RUNTIME_PATH": "/defaults",
-    "DRI_NODE":           os.environ.get("DRI_NODE", ""),
-    "DRINODE":            os.environ.get("DRINODE", ""),
     "HOME":               "/config",
     "USER":               "abc",
     "LD_PRELOAD":         "/usr/lib/selkies_joystick_interposer.so",
@@ -174,6 +219,20 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("broker")
+
+# Report the forwarded GPU environment at startup. Renderer complaints almost
+# always begin with "my env vars aren't taking effect", and this line answers
+# that question from the broker log without a shell in the container.
+_forwarded_gpu = sorted(GPU_ENV)
+if _forwarded_gpu:
+    log.info("Forwarding GPU environment to Eden: %s", ", ".join(_forwarded_gpu))
+else:
+    log.info(
+        "No GPU environment variables found to forward. If the renderer falls back to "
+        "llvmpipe, run `vulkaninfo --summary` in the container: NVIDIA absent means the "
+        "ICD was never injected (check NVIDIA_DRIVER_CAPABILITIES includes 'graphics'); "
+        "NVIDIA present means the failure is at surface creation instead."
+    )
 
 # Eden's stdout/stderr is captured to this file so renderer/Vulkan/Qt errors
 # are visible after the fact, regardless of broker log level. /config is the
@@ -220,28 +279,78 @@ def _save_data_root() -> Path | None:
 
 def _iter_save_files(root: Path) -> list[Path]:
     """Every regular file under the allowed save subtrees, sorted for a
-    deterministic archive (identical content zips to identical bytes)."""
+    deterministic archive (identical content zips to identical bytes).
+
+    Dot-prefixed path components are excluded: a restore writes each member
+    through a `.<name>.tmp` staging file in the same directory, and a GET that
+    overlaps one must not sweep that half-written temp into the archive."""
     files: list[Path] = []
     for sub in SAVE_SYNC_SUBTREES:
         base = root / sub
         if not base.is_dir():
             continue
         files.extend(
-            p for p in sorted(base.rglob("*")) if p.is_file() and not p.is_symlink()
+            p
+            for p in sorted(base.rglob("*"))
+            if p.is_file()
+            and not p.is_symlink()
+            and not any(part.startswith(".") for part in p.relative_to(base).parts)
         )
     return files
 
 
-def _build_save_archive(baseline: float) -> bytes | None:
+def _read_file_stable(
+    p: Path, retries: int = 4, settle: float = 0.5
+) -> tuple[bytes, float] | None:
+    """Read `p` only when its size/mtime are identical before and after the
+    read, so a save Eden is mid-writing to NAND is never shipped torn. Returns
+    (contents, mtime), or None when the file stays unstable through every retry
+    or cannot be read."""
+    for attempt in range(retries):
+        try:
+            st_before = p.stat()
+            data = p.read_bytes()
+            st_after = p.stat()
+        except OSError as exc:
+            log.warning("save-file: could not read %s — %s", p, exc)
+            return None
+        if (st_before.st_size, st_before.st_mtime_ns) == (
+            st_after.st_size,
+            st_after.st_mtime_ns,
+        ):
+            return data, st_after.st_mtime
+        if attempt < retries - 1:
+            time.sleep(settle)
+    log.warning("save-file: %s still being written — skipped this pull", p)
+    return None
+
+
+class NoSaveArchive(Exception):
+    """There is no archive to serve, and why. Carries the HTTP status because
+    the reason for having nothing is what picks it, and that knowledge belongs
+    at the point the reason is discovered rather than in a union the caller has
+    to re-decode."""
+
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def _build_save_archive(baseline: float) -> tuple[bytes, int]:
     """Zip every save file modified since the last game launch.
 
-    Returns None when there is nothing to sync — no data dir yet, or no file
-    changed since `baseline`. Member paths are relative to the data dir so a
-    later PUT restores them regardless of which candidate dir is live."""
+    Returns (zip_bytes, skipped), where `skipped` counts files left out because
+    they were unreadable or still being written. Raises NoSaveArchive when there
+    is nothing to hand back: no data dir yet, no file changed since `baseline`,
+    the changed set over the size limit, or every changed file mid-write — that
+    last one refused rather than served as an empty archive the caller would
+    record as a clean sync. Member paths are relative to the data dir so a later
+    PUT restores them regardless of which candidate dir is live."""
     root = _save_data_root()
     if root is None:
         log.debug("save-file: no Eden data dir found")
-        return None
+        raise NoSaveArchive(404, "no save changes since last launch")
     changed: list[Path] = []
     total = 0
     for p in _iter_save_files(root):
@@ -253,18 +362,32 @@ def _build_save_archive(baseline: float) -> bytes | None:
             changed.append(p)
             total += st.st_size
     if not changed:
-        return None
+        raise NoSaveArchive(404, "no save changes since last launch")
     if total > SAVE_FILE_MAX_BYTES:
         log.warning("save-file: changed saves exceed size limit (%d bytes)", total)
-        return None
+        raise NoSaveArchive(413, f"changed saves exceed size limit ({total} bytes)")
     buf = io.BytesIO()
+    skipped = 0
+    wrote = 0
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         for p in changed:
-            try:
-                zf.write(p, p.relative_to(root).as_posix())
-            except OSError as exc:
-                log.warning("save-file: could not read %s — %s", p, exc)
-    return buf.getvalue()
+            result = _read_file_stable(p)
+            if result is None:
+                skipped += 1
+                continue
+            data, mtime = result
+            # UTC, matched by calendar.timegm on extract — a TZ difference
+            # between the GET and PUT containers must not shift mtimes and
+            # silently break the newer-file guard.
+            info = zipfile.ZipInfo(
+                p.relative_to(root).as_posix(),
+                date_time=time.gmtime(mtime)[:6],
+            )
+            zf.writestr(info, data, zipfile.ZIP_DEFLATED)
+            wrote += 1
+    if wrote == 0:
+        raise NoSaveArchive(503, "save files are still being written; retry shortly")
+    return buf.getvalue(), skipped
 
 
 def _mkdirs_owned(path: Path) -> None:
@@ -283,12 +406,15 @@ def _mkdirs_owned(path: Path) -> None:
             pass
 
 
-def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
+def _extract_save_archive(content: bytes) -> tuple[int, int, int] | str:
     """Restore a pulled save archive into the data dir.
 
-    Returns (written, skipped) on success, or an error string for a bad
-    archive. Existing files newer than their archive member are skipped so a
-    restore can never roll back saves made since the archive was taken."""
+    Returns (written, skipped, failed), or an error string for a bad archive.
+    Existing files newer than their archive member are skipped so a restore can
+    never roll back saves made since the archive was taken. A per-file write
+    failure doesn't abort the restore — remaining members still land, the
+    failure is counted, and the handler reports it; the mtime guard makes a
+    retry of the same archive idempotent."""
     root = _save_data_root() or _SAVE_DATA_ROOTS[0]
     try:
         zf = zipfile.ZipFile(io.BytesIO(content))
@@ -307,10 +433,15 @@ def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
             ):
                 return f"archive member outside save subtrees: {info.filename}"
 
-        written = skipped = 0
+        written = skipped = failed = 0
         for info in infos:
             target = root / PurePosixPath(info.filename)
-            mtime = time.mktime(info.date_time + (0, 0, -1))
+            # timegm, matching the gmtime stamp _build_save_archive writes.
+            # time.mktime would read the entry as local time, so a GET and PUT
+            # in containers with different TZ would shift every mtime by the
+            # offset and silently misfire the newer-file guard below.
+            mtime = calendar.timegm(info.date_time)
+            tmp = None
             try:
                 if (
                     target.exists()
@@ -325,9 +456,20 @@ def _extract_save_archive(content: bytes) -> tuple[int, int] | str:
                 os.replace(tmp, target)
                 os.utime(target, (mtime, mtime))
             except OSError as exc:
-                return f"could not write {info.filename}: {exc}"
+                log.warning("save-file: could not restore %s — %s", info.filename, exc)
+                failed += 1
+                # The staging file is dot-prefixed, which _iter_save_files
+                # deliberately hides from every later pull — so nothing else
+                # would ever sweep it. A disk-full restore must not leave one
+                # invisible partial file per member behind.
+                if tmp is not None:
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                continue
             written += 1
-    return (written, skipped)
+    return (written, skipped, failed)
 
 # ── Session state ─────────────────────────────────────────────────────────────
 
@@ -342,11 +484,95 @@ _session: dict = {
     # timestamps with one-second resolution can collide across rapid
     # relaunches; a counter makes session-change detection unambiguous.
     "launch_id":  0,
+    # Claim shared by every kill+relaunch path so two lifecycle sequences can
+    # never interleave over one session.
+    "launch_in_progress": False,
+    # Set when the crash-loop limiter gives up. /status exposes it so a pooled
+    # fleet can tell "idle, waiting for a user" from "broker surrendered".
+    "relaunch_abandoned": False,
     # Wall-clock stamp of the last GAME launch (not dashboard relaunches).
     # GET /save-file only ships files modified at or after this point; it
     # survives game exit so RomM can still pull after the session ends.
     "save_baseline": None,
+    # Random per-session token gating the stream proxy on port 3001. Minted on
+    # /launch, swapped for a cookie by the browser, cleared on release.
+    "stream_token": None,
 }
+
+# ── Stream token ──────────────────────────────────────────────────────────────
+# The browser-facing stream on port 3001 is otherwise open to anyone who can
+# reach the port. Each /launch mints a token bound to that session; nginx sends
+# every 3001 request to /verify as an auth_request subrequest, and the broker
+# admits only requests carrying the live token.
+
+
+def _issue_stream_token() -> str:
+    """Mint a fresh stream token and bind it to the current session."""
+    token = secrets.token_urlsafe(32)
+    with _session_lock:
+        _session["stream_token"] = token
+    return token
+
+
+def _check_stream_token(token: str) -> bool:
+    """Constant-time check of token against the live session token."""
+    if not token:
+        return False
+    with _session_lock:
+        current = _session["stream_token"]
+    if not current:
+        return False
+    return hmac.compare_digest(token, current)
+
+
+def _clear_stream_token() -> None:
+    """Drop the stream token so the gate rejects everything until next launch."""
+    with _session_lock:
+        _session["stream_token"] = None
+
+
+def _extract_stream_token(query: str, cookie_header: str | None) -> str | None:
+    """Read the stream token: query stream_token wins, else the stream_sid cookie."""
+    qs = parse_qs(query)
+    if qs.get("stream_token"):
+        return qs["stream_token"][0]
+    if cookie_header:
+        jar = SimpleCookie()
+        jar.load(cookie_header)
+        if "stream_sid" in jar:
+            return jar["stream_sid"].value
+    return None
+
+
+def _stream_cookie_value(token: str) -> str:
+    """Set-Cookie value for the stream session. SameSite=None, Secure, and
+    Partitioned are required: the iframe is cross-site to RomM, so the cookie is
+    third-party and browsers partition or drop it without these attributes."""
+    return (
+        f"stream_sid={token}; HttpOnly; Secure; "
+        "SameSite=None; Partitioned; Path=/"
+    )
+
+
+def _verify_stream_decision(
+    original_uri: str, cookie_header: str | None
+) -> tuple[int, str | None]:
+    """Decide an nginx auth_request subrequest for the stream gate.
+
+    Returns (status, set_cookie). 200 admits the request, 403 rejects it. When
+    the token arrives in the query (the first iframe load), the caller gets a
+    Set-Cookie so later requests carry stream_sid and the token drops out of the
+    URL. A cookie-authed request that is already good gets no Set-Cookie back,
+    so nginx does not rewrite it.
+    """
+    query = urlparse(original_uri).query
+    token = _extract_stream_token(query, cookie_header)
+    if not _check_stream_token(token or ""):
+        return 403, None
+    if "stream_token" in parse_qs(query):
+        return 200, _stream_cookie_value(token)
+    return 200, None
+
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -434,9 +660,10 @@ def _pick_rom_file(candidates: Iterable[Path], base: Path) -> Path | None:
         are in. Comparing the numbers also keeps 'Disc 2' ahead of 'Disc 10',
         which sorting the names as text does not.
       * format next, because among candidates for the same disc it decides
-        which title to boot.
+        which title to boot: a cartridge dump beats the eShop package beside
+        it, and both beat a homebrew .nro.
       * then depth, so the title sitting in the game folder wins over one
-        buried in an extras subfolder.
+        buried in an extras or updates subfolder.
     """
     ranked: list[tuple[int, int, int, str, Path]] = []
     for p in candidates:
@@ -821,7 +1048,10 @@ def _launch_eden_internal(rom_path):
             cmd,
             stdout=log_fh if log_fh else subprocess.DEVNULL,
             stderr=subprocess.STDOUT if log_fh else subprocess.DEVNULL,
-            preexec_fn=os.setpgrp,
+            # New session ⇒ own process group, so killpg is clean. Unlike
+            # preexec_fn (unsafe with threads — it can deadlock between fork and
+            # exec in this ThreadingHTTPServer process), this is thread-safe.
+            start_new_session=True,
         )
     except OSError as exc:
         log.error("_launch_eden_internal: failed to launch Eden: %s", exc)
@@ -839,12 +1069,33 @@ def _launch_eden_internal(rom_path):
     with _session_lock:
         _session["process"] = proc
         _session["is_managed"] = True
+        # An instance is up again — whatever the limiter concluded is stale.
+        _session["relaunch_abandoned"] = False
     log.info("Eden launched (PID %d)", proc.pid)
     Thread(target=_monitor_process, args=(proc, time.monotonic()), daemon=True).start()
 
 
+# Consecutive sub-5s exits before the monitor stops relaunching. An Eden that
+# dies instantly every time (missing lib, dead display, bad Vulkan ICD) must not
+# respawn forever; an explicit POST /launch resets the counter so recovery is
+# manual and deliberate.
+_CRASH_LOOP_LIMIT = 3
+_rapid_exits = 0  # guarded by _session_lock
+
+
+def _reset_crash_counter() -> None:
+    """Forget the crash history. Called only from the request handlers: an
+    operator asking for a launch is the deliberate act that earns a container a
+    clean slate. The monitor's automatic relaunch must never call this, or the
+    count resets on every crash and the limiter never trips."""
+    global _rapid_exits
+    with _session_lock:
+        _rapid_exits = 0
+
+
 def _monitor_process(proc, start_time):
     """On unexpected exit, relaunch the dashboard if the session is still managed."""
+    global _rapid_exits
     proc.wait()
     exit_code = proc.returncode
     duration = time.monotonic() - start_time
@@ -853,11 +1104,31 @@ def _monitor_process(proc, start_time):
         exit_code, duration,
     )
 
+    rapid = 0
     with _session_lock:
         should_relaunch = _session["is_managed"] and _session["process"] is proc
+        # Only unexpected exits count toward the crash-loop limit — a deliberate
+        # kill (/save-and-exit, DELETE /launch) cleared is_managed and must not
+        # push the counter toward a false trip.
+        if should_relaunch:
+            if duration < 5:
+                _rapid_exits += 1
+            else:
+                _rapid_exits = 0
+            rapid = _rapid_exits
 
     if not should_relaunch:
         log.debug("_monitor_process: managed=False or proc replaced — not relaunching")
+        return
+
+    if rapid >= _CRASH_LOOP_LIMIT:
+        log.error(
+            "Eden exited within 5s %d times in a row — giving up on relaunch. "
+            "Fix the underlying failure, then POST /launch to recover.",
+            rapid,
+        )
+        with _session_lock:
+            _session["relaunch_abandoned"] = True
         return
 
     wait_time = 5 if duration < 5 else 1
@@ -867,12 +1138,24 @@ def _monitor_process(proc, start_time):
     )
     time.sleep(wait_time)
 
-    with _session_lock:
-        if not _session["is_managed"]:
-            log.debug("_monitor_process: managed cleared during sleep — aborting relaunch")
-            return
-
-    _launch_eden(None)
+    # The crash relaunch is a lifecycle sequence like any other: it must hold
+    # the launch claim, or a concurrent /launch interleaves with it and the
+    # monitor stomps the new game's session state with Dashboard.
+    if not _claim_launch():
+        log.info("Crash relaunch skipped — a launch is already in progress")
+        return
+    try:
+        with _session_lock:
+            # Re-check under the claim: _kill_eden ended the session, or a
+            # /launch that completed before we claimed installed a new process
+            # (in which case `process` is no longer OUR dead proc).
+            if not _session["is_managed"] or _session["process"] is not proc:
+                log.debug("_monitor_process: superseded under the claim — aborting relaunch")
+                return
+        _launch_eden(None)
+    finally:
+        with _session_lock:
+            _session["launch_in_progress"] = False
 
 
 def _wait_for_no_eden(timeout: float = 3.0) -> bool:
@@ -888,31 +1171,72 @@ def _wait_for_no_eden(timeout: float = 3.0) -> bool:
     return False
 
 
-def _launch_eden(rom_path):
-    """Top-level launch: kill any running Eden, clean sockets, patch ini, launch."""
-    _kill_eden()
-    _drain_gamepad_sockets()
-    _patch_ini()
-    if not _wait_for_no_eden():
-        log.warning("eden still running after kill+drain; relaunching anyway")
-
+def _claim_launch() -> bool:
+    """Atomically claim launch_in_progress. Every kill+relaunch path must hold
+    this claim so two lifecycle sequences can never interleave."""
     with _session_lock:
-        _session["launch_id"] += 1
-        launch_id = _session["launch_id"]
-        _session["rom_path"] = rom_path
-        _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
-        # Only stamp a session start when an actual ROM is being played; the
-        # dashboard is an idle state and should not appear in /status.
-        _session["started_at"] = (
-            time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) if rom_path else None
-        )
-        # Dashboard relaunches keep the previous baseline so an end-of-session
-        # save pull still sees the files the last game wrote.
+        if _session["launch_in_progress"]:
+            return False
+        _session["launch_in_progress"] = True
+        return True
+
+
+def _launch_eden(rom_path, release_claim=False):
+    """Top-level launch: kill any running Eden, clean sockets, patch ini, launch.
+
+    Deliberately does NOT touch the crash-loop counter: the monitor's own
+    relaunch comes through here too, so resetting it here would clear the count
+    on every crash and the limiter could never reach its threshold. Only the
+    request handlers reset it, via _reset_crash_counter."""
+    try:
+        _kill_eden()
+        _drain_gamepad_sockets()
+        _patch_ini()
+        if not _wait_for_no_eden():
+            # _kill_eden already reaped the managed process group, so any
+            # survivor is an unmanaged stray. Strays sit on top of the new game
+            # window, steal xdotool targeting for the F11 fullscreen toggle, and
+            # hold the GPU and audio device — reap them.
+            log.warning("Stray eden still running after kill+drain — sending SIGKILL")
+            subprocess.run(["pkill", "-9", "-x", "eden"], capture_output=True)
+            if not _wait_for_no_eden():
+                log.error("Stray eden survived SIGKILL; new instance may misbehave")
+
+        with _session_lock:
+            _session["launch_id"] += 1
+            launch_id = _session["launch_id"]
+            _session["rom_path"] = rom_path
+            _session["rom_name"] = Path(rom_path).stem if rom_path else "Dashboard"
+            # Only stamp a session start when an actual ROM is being played; the
+            # dashboard is an idle state and should not appear in /status.
+            _session["started_at"] = (
+                time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()) if rom_path else None
+            )
+            # Dashboard relaunches keep the previous baseline so an end-of-session
+            # save pull still sees the files the last game wrote.
+            if rom_path:
+                _session["save_baseline"] = time.time()
+        _launch_eden_internal(rom_path)
         if rom_path:
-            _session["save_baseline"] = time.time()
-    _launch_eden_internal(rom_path)
-    if rom_path:
-        Thread(target=_trigger_fullscreen, args=(launch_id,), daemon=True).start()
+            Thread(target=_trigger_fullscreen, args=(launch_id,), daemon=True).start()
+    finally:
+        # Only the caller that claimed launch_in_progress may release it —
+        # clearing it unconditionally would wipe a concurrent claim and reopen
+        # the TOCTOU.
+        if release_claim:
+            with _session_lock:
+                _session["launch_in_progress"] = False
+
+
+def _relaunch_dashboard():
+    """Dashboard relaunch that respects the launch claim. If a /launch is
+    already in flight, skip: that launch's kill+start sequence supersedes the
+    dashboard anyway, and interleaving the two corrupts both."""
+    if not _claim_launch():
+        log.info("Dashboard relaunch skipped — a launch is already in progress")
+        return
+    _reset_crash_counter()
+    _launch_eden(None, release_claim=True)
 
 
 # ── PulseAudio helpers ────────────────────────────────────────────────────────
@@ -978,84 +1302,84 @@ class BrokerHandler(BaseHTTPRequestHandler):
             SECRET,
         )
 
-    def _send_json(self, code: int, body: dict) -> None:
+    def _verify_stream(self) -> None:
+        # nginx auth_request subrequest for the stream gate. nginx forwards the
+        # real request URI (carrying the stream_token query on first load) via
+        # X-Original-URI and the browser Cookie header; the broker returns 200
+        # to admit or 403 to reject, and a Set-Cookie on the query bootstrap.
+        status, set_cookie = _verify_stream_decision(
+            self.headers.get("X-Original-URI", ""),
+            self.headers.get("Cookie"),
+        )
+        headers = {"Set-Cookie": set_cookie} if set_cookie else None
+        self._send_json(status, {"ok": status == 200}, headers)
+
+    def _send_json(self, code: int, body: dict, headers: dict | None = None) -> None:
         payload = json.dumps(body).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
+        for name, value in (headers or {}).items():
+            self.send_header(name, value)
         self.end_headers()
         self.wfile.write(payload)
         log.debug("HTTP response: %d %s", code, body)
 
-    def _read_body(self) -> dict:
+    def _read_body(self) -> dict | None:
+        """Parse the JSON request body. Returns {} for an absent body. Sends the
+        error response itself and returns None when the body is oversized or not
+        a JSON object — callers must bail out on None."""
         try:
-            length = max(0, min(int(self.headers.get("Content-Length", 0)), 64 * 1024))
+            length = int(self.headers.get("Content-Length", 0))
         except ValueError:
             length = 0
-        if length == 0:
+        if length <= 0:
             return {}
+        if length > _BODY_MAX_BYTES:
+            self._send_json(413, {"error": "request body too large"})
+            return None
+        raw = self.rfile.read(length)
         try:
-            return json.loads(self.rfile.read(length))
+            body = json.loads(raw)
         except json.JSONDecodeError:
-            return {}
+            self._send_json(400, {"error": "body is not valid JSON"})
+            return None
+        if not isinstance(body, dict):
+            self._send_json(400, {"error": "body must be a JSON object"})
+            return None
+        return body
 
-    def do_GET(self):
-        log.debug("HTTP GET %s", self.path)
-        if self.path == "/health":
-            self._send_json(200, {"status": "ok"})
-        elif not self._check_secret():
-            # /health stays open for container healthchecks; all other GETs
-            # require the shared secret, matching POST/DELETE.
-            self._send_json(403, {"error": "forbidden"})
-        elif self.path == "/status":
-            with _session_lock:
-                active = (
-                    _session["process"] is not None
-                    and _session["process"].poll() is None
-                    and _session["rom_path"] is not None
-                )
-                rom_path   = _session["rom_path"]   if active else None
-                rom_name   = _session["rom_name"]   if active else None
-                started_at = _session["started_at"] if active else None
-            self._send_json(200, {
-                "active":     active,
-                "rom_path":   rom_path,
-                "rom_name":   rom_name,
-                "started_at": started_at,
-            })
-        elif self.path == "/save-file":
-            with _session_lock:
-                baseline = _session["save_baseline"]
-                rom_name = _session["rom_name"]
-            if baseline is None:
-                self._send_json(404, {"error": "no game has been launched"})
-                return
-            archive = _build_save_archive(baseline)
-            if archive is None:
-                self._send_json(404, {"error": "no save changes since last launch"})
-                return
-            # Header values must be latin-1; ROM stems can be anything.
-            safe_name = "".join(
-                c for c in (rom_name or "eden") if c.isascii() and c.isprintable()
-            ).strip() or "eden"
-            self.send_response(200)
-            self.send_header("Content-Type", "application/zip")
-            self.send_header("Content-Length", str(len(archive)))
-            self.send_header("X-Save-Filename", f"{safe_name}.saves.zip")
-            self.end_headers()
-            self.wfile.write(archive)
-            log.info("save-file: served archive (%d bytes)", len(archive))
-        else:
-            self._send_json(404, {"error": "not found"})
+    def _get_save_file(self):
+        with _session_lock:
+            baseline = _session["save_baseline"]
+            rom_name = _session["rom_name"]
+        if baseline is None:
+            self._send_json(404, {"error": "no game has been launched"})
+            return
+        try:
+            archive, unstable = _build_save_archive(baseline)
+        except NoSaveArchive as exc:
+            self._send_json(exc.status, {"error": exc.message})
+            return
+        # Header values must be latin-1; ROM stems can be anything.
+        safe_name = "".join(
+            c for c in (rom_name or "eden") if c.isascii() and c.isprintable()
+        ).strip() or "eden"
+        self.send_response(200)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Length", str(len(archive)))
+        self.send_header("X-Save-Filename", f"{safe_name}.saves.zip")
+        if unstable:
+            # Files skipped mid-write; the caller can tell this pull was partial.
+            self.send_header("X-Save-Skipped-Unstable", str(unstable))
+        self.end_headers()
+        self.wfile.write(archive)
+        log.info(
+            "save-file: served archive (%d bytes, %d unstable skipped)",
+            len(archive), unstable,
+        )
 
-    def do_PUT(self):
-        log.debug("HTTP PUT %s", self.path)
-        if not self._check_secret():
-            self._send_json(403, {"error": "forbidden"})
-            return
-        if self.path != "/save-file":
-            self._send_json(404, {"error": "not found"})
-            return
+    def _put_save_file(self):
         try:
             length = int(self.headers.get("Content-Length", 0))
         except ValueError:
@@ -1067,26 +1391,91 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(413, {"error": "archive too large"})
             return
         content = self.rfile.read(length)
+        if len(content) != length:
+            self._send_json(400, {"error": "truncated request body"})
+            return
         result = _extract_save_archive(content)
         if isinstance(result, str):
             self._send_json(400, {"error": result})
             return
-        written, skipped = result
+        written, skipped, failed = result
+        if failed:
+            log.warning(
+                "save-file: restore incomplete — %d written, %d skipped, %d failed",
+                written, skipped, failed,
+            )
+            self._send_json(500, {
+                "error": "some archive members could not be written",
+                "written": written, "skipped": skipped, "failed": failed,
+            })
+            return
         log.info("save-file: restored archive — %d written, %d skipped", written, skipped)
         self._send_json(200, {"status": "ok", "written": written, "skipped": skipped})
+
+    def do_GET(self):
+        log.debug("HTTP GET %s", self.path)
+        path = urlparse(self.path).path
+        if path == "/health":
+            self._send_json(200, {"status": "ok"})
+        elif path == "/verify":
+            self._verify_stream()
+        elif not self._check_secret():
+            # /health and /verify stay open; /health for container healthchecks,
+            # /verify because the stream token is itself the credential (nginx
+            # auth_request cannot forward the broker secret). All other GETs
+            # require the shared secret, matching POST/DELETE.
+            self._send_json(403, {"error": "forbidden"})
+        elif path == "/status":
+            with _session_lock:
+                active = (
+                    _session["process"] is not None
+                    and _session["process"].poll() is None
+                    and _session["rom_path"] is not None
+                )
+                rom_path     = _session["rom_path"]     if active else None
+                rom_name     = _session["rom_name"]     if active else None
+                started_at   = _session["started_at"]   if active else None
+                stream_token = _session["stream_token"] if active else None
+                abandoned    = _session["relaunch_abandoned"]
+            self._send_json(200, {
+                "active":     active,
+                "rom_path":   rom_path,
+                "rom_name":   rom_name,
+                "started_at": started_at,
+                # True once the crash-loop limiter gave up: nothing is running
+                # and nothing will restart it without an explicit POST /launch.
+                # Distinguishes a dead container from an idle dashboard.
+                "relaunch_abandoned": abandoned,
+                "stream_token": stream_token,
+            })
+        elif path == "/save-file":
+            self._get_save_file()
+        else:
+            self._send_json(404, {"error": "not found"})
+
+    def do_PUT(self):
+        log.debug("HTTP PUT %s", self.path)
+        if not self._check_secret():
+            self._send_json(403, {"error": "forbidden"})
+            return
+        if urlparse(self.path).path != "/save-file":
+            self._send_json(404, {"error": "not found"})
+            return
+        self._put_save_file()
 
     def do_POST(self):
         log.debug("HTTP POST %s", self.path)
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
             return
+        path = urlparse(self.path).path
 
-        if self.path == "/cleanup":
+        if path == "/cleanup":
             Thread(target=_cleanup_sockets, daemon=True).start()
             self._send_json(200, {"status": "cleanup started"})
             return
 
-        if self.path == "/save-and-exit":
+        if path == "/save-and-exit":
             # Eden does not support save states — just exit the game.
             # The Switch's own in-game save system handles persistence.
             with _session_lock:
@@ -1094,29 +1483,55 @@ class BrokerHandler(BaseHTTPRequestHandler):
                     self._send_json(409, {"error": "no game is running"})
                     return
             body = self._read_body()
+            if body is None:
+                return
             wait = body.get("wait", True)
+            # Same claim as POST and DELETE /launch. This is a kill+start
+            # sequence like any other: without the claim, a /launch running
+            # concurrently has its freshly spawned Eden reaped by the kill
+            # below, and the dashboard relaunch that should follow is then
+            # skipped because that launch still holds the claim.
+            if not _claim_launch():
+                self._send_json(409, {"error": "launch already in progress"})
+                return
             log.info("save-and-exit: exiting game (no save state support)")
+            # Save-and-exit releases the session, so the stream token must die
+            # with it: a discovered host is otherwise still usable.
+            _clear_stream_token()
+            _reset_crash_counter()
             if wait:
                 _kill_eden()
                 self._send_json(200, {"status": "ok", "saved": False})
-                Thread(target=_launch_eden, args=(None,), daemon=True).start()
+                # release_claim=True: this handler claimed, so the relaunch it
+                # spawns is what releases, once the dashboard is back up.
+                Thread(target=_launch_eden, args=(None, True), daemon=True).start()
             else:
+                # Clear visible session state synchronously so that callers
+                # polling /status immediately after this response observe "no
+                # game running" instead of a stale rom_path. The background
+                # thread still runs the actual kill+relaunch.
+                with _session_lock:
+                    _session["rom_path"] = None
+                    _session["rom_name"] = "Dashboard"
+                    _session["started_at"] = None
                 # _launch_eden kills any running instance first, so no separate
                 # _kill_eden is needed here.
-                Thread(target=_launch_eden, args=(None,), daemon=True).start()
+                Thread(target=_launch_eden, args=(None, True), daemon=True).start()
                 self._send_json(200, {"status": "queued", "saved": False})
             return
 
-        if self.path == "/save-state":
+        if path == "/save-state":
             self._send_json(501, {"error": "save states are not supported by Eden"})
             return
 
-        if self.path == "/load-state":
+        if path == "/load-state":
             self._send_json(501, {"error": "save states are not supported by Eden"})
             return
 
-        if self.path == "/volume":
+        if path == "/volume":
             body = self._read_body()
+            if body is None:
+                return
             level = body.get("level")
             if not isinstance(level, int) or not (0 <= level <= 100):
                 self._send_json(400, {"error": "level must be an integer 0–100"})
@@ -1129,8 +1544,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "level": level})
             return
 
-        if self.path == "/mute":
+        if path == "/mute":
             body = self._read_body()
+            if body is None:
+                return
             if "mute" in body:
                 mute_arg = "1" if body["mute"] else "0"
             else:
@@ -1144,11 +1561,13 @@ class BrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, {"status": "ok", "mute": mute_state})
             return
 
-        if self.path != "/launch":
+        if path != "/launch":
             self._send_json(404, {"error": "not found"})
             return
 
         body = self._read_body()
+        if body is None:
+            return
         raw_path = body.get("rom_path", "").strip()
 
         if not raw_path:
@@ -1180,19 +1599,43 @@ class BrokerHandler(BaseHTTPRequestHandler):
             log.info("Resolved ROM folder %s to %s", rom_path, rom_file)
         rom_path = rom_file
 
-        Thread(target=_launch_eden, args=(str(rom_path),), daemon=True).start()
-        self._send_json(200, {"status": "launching", "rom_path": str(rom_path)})
+        # Claim before spawning: two concurrent launches would otherwise run two
+        # kill+start sequences against one session, and the loser's Eden would
+        # be reaped mid-boot by the winner's kill.
+        if not _claim_launch():
+            self._send_json(409, {"error": "launch already in progress"})
+            return
+
+        # An operator asking for a game is the deliberate act that clears a
+        # crash-loop surrender; see _reset_crash_counter.
+        _reset_crash_counter()
+        stream_token = _issue_stream_token()
+        Thread(target=_launch_eden, args=(str(rom_path), True), daemon=True).start()
+        self._send_json(200, {
+            "status": "launching",
+            "rom_path": str(rom_path),
+            "stream_token": stream_token,
+        })
 
     def do_DELETE(self):
         log.debug("HTTP DELETE %s", self.path)
         if not self._check_secret():
             self._send_json(403, {"error": "forbidden"})
             return
-        if self.path != "/launch":
+        if urlparse(self.path).path != "/launch":
             self._send_json(404, {"error": "not found"})
             return
 
-        Thread(target=_launch_eden, args=(None,), daemon=True).start()
+        # Same claim as POST /launch — a soft reset interleaved with a live
+        # launch would run two kill+start sequences against one session.
+        if not _claim_launch():
+            self._send_json(409, {"error": "launch already in progress"})
+            return
+        # DELETE /launch releases the session, so the stream token must die with
+        # it: a discovered host is otherwise still usable.
+        _clear_stream_token()
+        _reset_crash_counter()
+        Thread(target=_launch_eden, args=(None, True), daemon=True).start()
         log.info("Soft reset: returning to dashboard")
         self._send_json(200, {"status": "resetting"})
 
@@ -1242,8 +1685,9 @@ def main():
     _patch_ini()
 
     # Auto-launch the Eden game library so the stream shows something useful
-    # while no game is running.
-    Thread(target=_launch_eden, args=(None,), daemon=True).start()
+    # while no game is running. Goes through the claim like every other
+    # lifecycle path, so a /launch arriving during startup cannot interleave.
+    Thread(target=_relaunch_dashboard, daemon=True).start()
 
     # ThreadingHTTPServer: /save-and-exit with wait=true kills Eden inline (up
     # to ~5s on a stubborn process); a single-threaded server would stall

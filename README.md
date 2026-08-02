@@ -12,6 +12,8 @@ Launch Switch games from the RomM web UI and stream them in the browser. Control
 - Volume and mute control via PulseAudio
 - Controller support via selkies joystick interposer (SDL engine mappings auto-seeded)
 - Dashboard auto-launches on broker start so the stream always shows something
+- In-game NAND save sync with the RomM library (`GET`/`PUT /save-file`)
+- Stream gated by a per-session token, so the 3001 port is not an open desktop — provided `BROKER_SECRET` is set (see below)
 - Save state UI hidden in the RomM player (Switch has no emulator-level save state support)
 
 ## Usage
@@ -47,15 +49,21 @@ services:
 
 | Variable | Default | Description |
 |---|---|---|
-| `BROKER_PORT` | `8000` | Port the broker HTTP API listens on |
-| `BROKER_SECRET` | *(unset)* | Shared secret for broker API auth. Set this. All POST/DELETE endpoints require `X-Broker-Secret` header when set. |
+| `BROKER_PORT` | `8000` | Port the broker HTTP API listens on. The nginx stream gate is pointed at the same port; a non-numeric or out-of-range value is logged and the gate falls back to `8000`. |
+| `BROKER_SECRET` | *(unset)* | Shared secret for broker API auth. **Set this.** All POST/DELETE endpoints require the `X-Broker-Secret` header when it is set — and accept anyone when it is not, which also defeats the [stream gate](#stream-gate), since `POST /launch` is what mints the stream token. |
 | `ROM_ROOT` | `/romm/library` | Absolute path to the RomM library root. ROM paths in API requests must be under this directory. |
 | `FULLSCREEN_DELAY` | `3.0` | Seconds to wait after game launch before sending F11 to enter fullscreen. Increase if Eden is slow to load on your hardware. |
 | `BROKER_LOG_LEVEL` | `INFO` | Log level for the broker (`DEBUG`, `INFO`, `WARNING`, `ERROR`). `DEBUG` also logs Eden stdout. |
 
 ## Broker API
 
-All write endpoints require `X-Broker-Secret: <secret>` when `BROKER_SECRET` is set.
+Every endpoint requires `X-Broker-Secret: <secret>` when `BROKER_SECRET` is set,
+except `/health` (container healthchecks) and `/verify` (nginx cannot forward
+the secret on a subrequest; the stream token is the credential there).
+
+Request bodies must be a JSON object and are capped at 64 KB — a larger body is
+rejected with `413` rather than truncated, and malformed JSON returns `400`
+instead of being silently treated as empty.
 
 ### `GET /health`
 Returns `{"status": "ok"}`. Always 200.
@@ -68,9 +76,16 @@ Returns the current session state.
   "active": true,
   "rom_path": "/romm/library/switch/game.nsp",
   "rom_name": "game",
-  "started_at": "2026-04-19T14:00:00Z"
+  "started_at": "2026-04-19T14:00:00Z",
+  "relaunch_abandoned": false,
+  "stream_token": "…"
 }
 ```
+
+`relaunch_abandoned` goes `true` once the crash-loop limiter has given up (see
+[Crash-loop limiter](#crash-loop-limiter)); it distinguishes a container that is
+broken from one that is merely idle at the dashboard. `stream_token` is the live
+token for the current session, or `null` when no game is running.
 
 ### `POST /launch`
 Launch a ROM. Eden is killed, sockets drained, ini patched, then the ROM is launched. Fullscreen is triggered after `FULLSCREEN_DELAY` seconds.
@@ -79,7 +94,13 @@ Launch a ROM. Eden is killed, sockets drained, ini patched, then the ROM is laun
 { "rom_path": "/romm/library/switch/game.nsp" }
 ```
 
-Returns `{"status": "launching", "rom_path": "..."}`.
+Returns `{"status": "launching", "rom_path": "...", "stream_token": "..."}`.
+
+`stream_token` is a fresh single-session token for the stream gate; RomM appends
+it to the iframe URL. Launching again mints a new one and invalidates the old.
+
+Returns `409` if another launch is already in flight — two kill+start sequences
+against one session would otherwise reap each other's Eden mid-boot.
 
 `rom_path` must exist and be under `ROM_ROOT`. It may be either a file or a
 **directory**, for libraries laid out one game per folder
@@ -108,7 +129,35 @@ extensions in an `extensions` field, which is a different message from the
 `422` for a path that does not exist at all.
 
 ### `DELETE /launch`
-Stop the current game and return to the Eden dashboard.
+Stop the current game and return to the Eden dashboard. Revokes the stream
+token. Returns `409` if a launch is already in flight.
+
+### `GET /save-file`
+Download the in-game NAND saves written since the current game was launched, as
+a zip. Members are paths relative to Eden's data root, under `nand/user/save`.
+Member timestamps are stamped in UTC so a pull and a push from containers in
+different timezones agree on which copy is newer.
+
+- `200` — `application/zip`, with `X-Save-Filename` and, when some files were
+  skipped because Eden was mid-write, `X-Save-Skipped-Unstable: <count>`
+- `404` — no game has been launched, or nothing changed since it was
+- `413` — the changed set exceeds 256 MB
+- `503` — every changed file was mid-write; retry shortly. (Serving an empty
+  archive here would let the caller record a clean sync it never got.)
+
+### `PUT /save-file`
+Restore a zip previously fetched from `GET /save-file`. A member is skipped when
+the local file is more than 2 s newer, so a stale archive never rolls back
+progress the player made since. Members escaping the save directory or falling
+outside `nand/user/save` are rejected outright.
+
+Returns `{"status": "ok", "written": n, "skipped": n}`, or `500` with the same
+counts plus `failed` when some members could not be written — the restore
+applies every member it can rather than abandoning the rest half-applied.
+
+### `GET /verify`
+The nginx `auth_request` endpoint for the stream gate — not called directly. See
+[Stream gate](#stream-gate).
 
 ### `POST /save-and-exit`
 Eden does not support save states. This endpoint kills the game and returns to the dashboard without saving. The Switch's in-game save system handles persistence.
@@ -120,7 +169,10 @@ Eden does not support save states. This endpoint kills the game and returns to t
 - `wait: true` (default) — blocks until Eden is killed, then returns
 - `wait: false` — fires kill in background, returns immediately (use for navigation away)
 
-Returns `{"status": "ok", "saved": false}`.
+Returns `{"status": "ok", "saved": false}`, or `409` with
+`{"error": "launch already in progress"}` if a launch is in flight — this is a
+kill+start sequence and takes the same claim as `POST`/`DELETE /launch`. Also
+revokes the stream token.
 
 ### `POST /save-state` / `POST /load-state`
 Returns `501 Not Implemented`. Eden has no emulator-level save state support.
@@ -168,6 +220,80 @@ RomM → broker (HTTP, port 8000)
                         selkies (WebRTC) ←─ browser (RomM player)
 ```
 
+### Stream gate
+
+RomM's own authentication never sits on the container's 3001 socket, so without
+a gate anyone who learns the address gets an interactive desktop with the ROM
+library mounted. `init.sh` injects an nginx `auth_request` into the 3001 SSL
+vhost (anchored on `ssl_certificate_key`, which appears only in that server
+block, so the plain 3000 vhost is untouched). Every request is sent to the
+broker's `/verify` as a subrequest, carrying the original URI and the browser's
+cookies.
+
+`POST /launch` mints the session token and returns it; RomM appends it to the
+iframe URL. On that first request the broker admits it and hands back a
+`stream_sid` cookie, so the token drops out of the URL and every later asset and
+the WebSocket upgrade ride the cookie instead. The cookie is
+`HttpOnly; Secure; SameSite=None; Partitioned` — the stream is cross-site to
+RomM's origin, and without those attributes the browser drops or partitions it
+away and everything after the first request 403s.
+
+The token dies with the session: a new launch invalidates the previous one, and
+`DELETE /launch` and `POST /save-and-exit` revoke it outright.
+
+**The gate is only as good as `BROKER_SECRET`.** `POST /launch` is what mints the
+token, and with no secret set the broker accepts that call from anyone — so
+anyone who can reach the broker port can mint a valid token and walk through the
+gate. Set the secret, and keep port 8000 off the network the way the compose
+example does. The broker logs a warning at startup when it is unset.
+
+The injection targets `/defaults/default.conf`, the template the base image's
+`init-nginx` copies over the live vhost on every start, rather than the live
+`/etc/nginx/sites-available/default` alone. The two init scripts sit on separate
+s6 branches with no ordering edge between them, so patching only the live file is
+a race: lose it and that copy silently wipes the gate. The live file is patched
+as well, covering the case where the copy has already happened.
+
+Nothing injected into the config may contain a `#`. When `PASSWORD` is set,
+`init-nginx` runs `sed -i 's/#//g'` over the whole file to uncomment its
+`auth_basic` lines, which would turn any comment into a bare invalid directive
+and stop nginx from starting.
+
+The gate proxies to the broker on `BROKER_PORT`, and re-points an existing
+injection on every start — `/defaults` lives in the image layer and survives a
+`docker restart`, so changing the port would otherwise leave the gate aimed at a
+dead socket and 500 every stream request. Once the live vhost exists, `nginx -t`
+runs against it: a missing SSL certificate is ignored (`init-nginx` generates it
+and may not have run yet), anything else is logged as an error with nginx's own
+message.
+
+The injection is idempotent and logs an error if the anchor ever disappears from
+the base image. If it does, the gate is simply absent — the stream keeps working
+but is no longer protected, so watch for that line in the container log.
+
+### Crash-loop limiter
+
+The broker relaunches the dashboard whenever Eden exits unexpectedly. If Eden
+dies within 5 s three times in a row — a missing library, a dead display, a bad
+Vulkan ICD — it stops relaunching and sets `relaunch_abandoned` in `/status`
+rather than respawning forever. Fix the underlying failure, then `POST /launch`
+to recover; a launch that ran for more than 5 s resets the counter, and a
+deliberate kill (`/save-and-exit`, `DELETE /launch`) never counts toward it.
+
+Every kill+relaunch path — including this one — takes a single launch claim, so
+two lifecycle sequences can never interleave and leave `/status` describing a
+game that is not the one on screen.
+
+### GPU environment
+
+`sudo`'s `env_reset` drops everything not explicitly passed, so the broker
+forwards the container's GPU-related variables through to Eden by name:
+`NVIDIA_*`, `VK_*`, `MESA_*`, `LIBGL_*`, `GALLIUM_*`, `RADV_*`, `AMD_*`, `DRI_*`,
+`LIBVA_*`, `VDPAU_*`, `__GLX_*`, `__NV_*`, `__EGL_*`, `__VK_*`, plus
+`XDG_DATA_DIRS` and `DRINODE`. The forwarded names are logged at startup; if the
+list comes back empty on a machine that should have a GPU, that log line is the
+first place to look for a session that fell back to llvmpipe.
+
 ### Display chain
 
 Eden runs on Xwayland (`:0`) inside a pixelflux compositor session (`WAYLAND_DISPLAY=wayland-1`). The selkies process captures the display and streams it over WebRTC. Stale Wayland/X11 sockets are cleaned up at container start by `init.sh` to ensure display indices stay predictable across restarts.
@@ -209,6 +335,9 @@ This mod is designed to work with the RomM `feature/eden-streaming` branch. The 
 - Proxies to this broker's `/launch` endpoint
 - Hides save/load state controls for the `switch` platform (`maxSlots: 0`)
 - Sends `POST /api/streaming/sessions/switch/save-and-exit` when leaving the player
+- Appends the `stream_token` from the launch response to the iframe URL — this
+  is platform-agnostic in RomM's `streaming.py`, so the gate needs no RomM change
+- Syncs in-game NAND saves to the library via `GET`/`PUT /save-file`
 
 ## Building
 
