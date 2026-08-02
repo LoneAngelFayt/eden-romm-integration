@@ -28,6 +28,9 @@ def clean_session():
         broker._session["launch_in_progress"] = False
         broker._session["relaunch_abandoned"] = False
         broker._session["stream_token"] = None
+        broker._session["stream_expires"] = 0.0
+        broker._session["stream_prev_token"] = None
+        broker._session["stream_prev_expires"] = 0.0
         broker._session["is_managed"] = False
         broker._session["process"] = None
         broker._session["rom_path"] = None

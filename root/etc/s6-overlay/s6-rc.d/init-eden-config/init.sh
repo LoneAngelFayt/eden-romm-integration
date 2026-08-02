@@ -1,5 +1,18 @@
 #!/usr/bin/with-contenv bash
 
+# Every patch below rewrites a file that a base-image service reads once, at
+# import or config-load time: selkies' input_handler.py, nginx's site config,
+# labwc's autostart. So init-services depends on this oneshot (see
+# init-services/dependencies.d/init-eden-config), which puts the whole service
+# stack behind it. Without that edge s6 starts the services in parallel with
+# this script, they win the race by several seconds, and every patch here lands
+# on disk having no effect at all on the processes already running: the stream
+# gate is absent from the live nginx and the selkies fixes never load — while
+# this script still reports success, which is what made it hard to spot.
+#
+# Keep this script fast and offline. Slow or networked work belongs in
+# init-eden-deps, which only the broker waits for.
+
 # ── XDG runtime dir ───────────────────────────────────────────────────────────
 XDG_RUNTIME_DIR="/config/.XDG"
 mkdir -p "$XDG_RUNTIME_DIR"
@@ -12,24 +25,23 @@ find "$XDG_RUNTIME_DIR" -name "wayland-*" -delete
 rm -rf /tmp/.X11-unix/X* /tmp/.X*lock
 echo "[broker-mod] Cleaned up stale display sockets."
 
-# ── python3 + wmctrl availability ────────────────────────────────────────────
-# Both are runtime requirements: broker.py is python3, and wmctrl/xdotool are
-# used to drive Eden's window. apt-get failure here means broker.service will
-# fail to start (or fail at runtime) so we exit non-zero to surface it
-# immediately instead of letting the operator chase a confusing broker error.
-_need_apt=0
-command -v python3 &>/dev/null || _need_apt=1
-command -v wmctrl  &>/dev/null || _need_apt=1
-if [ "$_need_apt" = "1" ]; then
-    echo "[broker-mod] Installing missing packages (python3, wmctrl)..."
-    if ! apt-get update -qq; then
-        echo "[broker-mod] FATAL: apt-get update failed — cannot install python3/wmctrl"
-        exit 1
+# ── Python interpreter for the patches below ─────────────────────────────────
+# The broker's own python3 is installed by init-eden-deps, which runs
+# concurrently with this script and may not have finished — so we cannot depend
+# on `python3` being on PATH here. selkies is itself a Python package, so the
+# interpreter that runs it is already in the image; prefer PATH, then the
+# bundled ones. Empty means the two patches below are skipped rather than
+# half-applied.
+PYBIN=""
+for _cand in python3 /lsiopy/bin/python3 /usr/bin/python3; do
+    if command -v "$_cand" &>/dev/null; then
+        PYBIN="$_cand"
+        break
     fi
-    if ! apt-get install -y -qq python3 wmctrl; then
-        echo "[broker-mod] FATAL: apt-get install failed — broker cannot run without python3/wmctrl"
-        exit 1
-    fi
+done
+if [ -z "$PYBIN" ]; then
+    echo "[broker-mod] ERROR: no python3 interpreter found (tried PATH, /lsiopy/bin, /usr/bin)."
+    echo "[broker-mod]   The selkies input_handler.py patches will be skipped."
 fi
 
 # ── Disable labwc autostart ───────────────────────────────────────────────────
@@ -61,6 +73,8 @@ if [ -z "$INPUT_HANDLER" ]; then
     echo "[broker-mod] ERROR: selkies input_handler.py not found — Python version glob matched nothing."
     echo "[broker-mod]   Expected: /lsiopy/lib/python3.*/site-packages/selkies/input_handler.py"
     echo "[broker-mod]   Selkies patches will be skipped. Check base image Python version."
+elif [ -z "$PYBIN" ]; then
+    echo "[broker-mod] ERROR: no interpreter to apply the selkies patches with — skipping."
 elif [ -f "$INPUT_HANDLER" ]; then
     # Patch 1: Active EOF detection in the keep-alive loop.
     #
@@ -83,7 +97,7 @@ elif [ -f "$INPUT_HANDLER" ]; then
     if grep -q "wait_for(reader.read(1)" "$INPUT_HANDLER"; then
         echo "[broker-mod] selkies input_handler.py EOF patch already applied."
     else
-        if python3 - "$INPUT_HANDLER" <<'PYEOF'
+        if "$PYBIN" - "$INPUT_HANDLER" <<'PYEOF'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1])
 text = p.read_text()
@@ -125,7 +139,7 @@ PYEOF
     if grep -q "setLevel(logging.WARNING)" "$INPUT_HANDLER"; then
         echo "[broker-mod] selkies_gamepad log-level patch already applied."
     else
-        if python3 - "$INPUT_HANDLER" <<'PYEOF'
+        if "$PYBIN" - "$INPUT_HANDLER" <<'PYEOF'
 import sys, pathlib
 p = pathlib.Path(sys.argv[1])
 old = 'logger_selkies_gamepad = logging.getLogger("selkies_gamepad")'
@@ -176,14 +190,20 @@ fi
 # Two base-image behaviours dictate the shape of this:
 #
 #   1. init-nginx re-copies /defaults/default.conf over the live vhost on every
-#      container start, and s6 gives us no ordering edge to it: init-eden-config
-#      hangs off init-config, init-nginx off init-selkies — separate branches
-#      under init-os-end, brought up concurrently. Patching only the live file is
-#      a coin flip, and losing the race means that cp silently wipes the gate and
-#      the stream comes up unauthenticated. So the template is the primary
-#      target; the live file is patched too, for the case where the cp already
-#      happened. Writing via a temp file and mv means a concurrent cp reads
-#      either the old template or the new one, never a half-written one.
+#      container start. On the current base image that cp is already done by the
+#      time we run — init-nginx is an ancestor of init-config-end, our only
+#      dependency (init-nginx → init-selkies-config → init-video →
+#      init-selkies-end → init-config → init-config-end) — so the live file is
+#      what nginx actually reads. Both are patched anyway: that chain is the base
+#      image's business and can be reordered under us, and a template left
+#      unpatched would have a later cp silently wipe the gate and bring the
+#      stream up unauthenticated. Writing via a temp file and mv means a
+#      concurrent cp reads either the old template or the new one, never a
+#      half-written one.
+#
+#      What we do control is that nginx has not started yet: svc-nginx depends on
+#      init-services, and init-services now depends on this script. Same edge
+#      covers svc-selkies and the input_handler patches below.
 #
 #   2. When PASSWORD is set, init-nginx runs `sed -i 's/#//g'` over the config to
 #      uncomment its auth_basic lines. That strips every '#' in the file, so a

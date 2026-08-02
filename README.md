@@ -54,6 +54,8 @@ services:
 | `ROM_ROOT` | `/romm/library` | Absolute path to the RomM library root. ROM paths in API requests must be under this directory. |
 | `FULLSCREEN_DELAY` | `3.0` | Seconds to wait after game launch before sending F11 to enter fullscreen. Increase if Eden is slow to load on your hardware. |
 | `BROKER_LOG_LEVEL` | `INFO` | Log level for the broker (`DEBUG`, `INFO`, `WARNING`, `ERROR`). `DEBUG` also logs Eden stdout. |
+| `STREAM_TOKEN_TTL` | `43200.0` | Seconds of **idle** time before a stream token expires. Every admitted request slides it forward, so it only fires on a session nobody is watching — it closes the gate on a container that lost its RomM side rather than capping a play session. |
+| `STREAM_TOKEN_GRACE` | `120.0` | Seconds a superseded token keeps working after a re-issue. See [stream gate](#stream-gate); shortening this to `0` restores the old cut-off-instantly behaviour and the 403 loop that came with it. |
 
 ## Broker API
 
@@ -220,6 +222,40 @@ RomM → broker (HTTP, port 8000)
                         selkies (WebRTC) ←─ browser (RomM player)
 ```
 
+### Init ordering
+
+The mod adds two s6 oneshots to the base image, and the split between them is
+load-bearing.
+
+`init-eden-config` does the patching: the nginx stream gate, the selkies
+`input_handler.py` rewrites, the Eden INI seeding. Every one of those edits a
+file that a base-image service reads at startup, so all of it has to be finished
+before any of those services start. That is what
+`init-services/dependencies.d/init-eden-config` buys — every `svc-*` longrun in
+the base image (`svc-nginx`, `svc-selkies`, `svc-xorg`, `svc-de` and the rest)
+already depends on `init-services`, so one edge in front of `init-services` puts
+the whole stack behind the patches.
+
+Without that edge the patches still run and still report success, but selkies
+has already imported `input_handler.py` by the time they land. The EOF-detection
+patch is then inert: dead gamepad clients are never reaped off the
+`/tmp/selkies_js*.sock` sockets, and the controller ends up bound to one of them.
+Video and keyboard keep working because each reconnect gets a fresh WebRTC
+session — this is the "live picture, dead pad" failure.
+
+`init-eden-deps` exists because of that edge, not in spite of it. Package
+installation is slow and networked, and anything slow inside `init-eden-config`
+now holds up the entire service stack, including the stream itself. So the
+`apt-get` work lives in its own oneshot that only `svc-broker` waits on. It
+normally installs nothing — the base image ships both `python3` and `xdotool` —
+and is there so an image that drops one fails loudly instead of confusing the
+broker at runtime.
+
+Because the two oneshots run concurrently, `init-eden-config` cannot assume
+`init-eden-deps` has finished. It resolves an interpreter itself (PATH,
+`/lsiopy/bin`, `/usr/bin`) and skips the selkies patches with an explicit error
+if it finds none, rather than failing silently.
+
 ### Stream gate
 
 RomM's own authentication never sits on the container's 3001 socket, so without
@@ -238,8 +274,20 @@ the WebSocket upgrade ride the cookie instead. The cookie is
 RomM's origin, and without those attributes the browser drops or partitions it
 away and everything after the first request 403s.
 
-The token dies with the session: a new launch invalidates the previous one, and
-`DELETE /launch` and `POST /save-and-exit` revoke it outright.
+The token dies with the session: `DELETE /launch` and `POST /save-and-exit`
+revoke it outright, and it expires on its own after `STREAM_TOKEN_TTL` seconds
+of idleness so an abandoned session stops holding the gate open.
+
+A new launch **supersedes** the previous token rather than dropping it: the old
+one stays valid for `STREAM_TOKEN_GRACE` seconds. Relaunching into an
+already-open tab means the browser is still replaying the old `stream_sid`
+cookie while RomM navigates the iframe to the new URL. Without that window every
+one of those in-flight requests 403s, the stream client reads it as a dropped
+connection and reconnects in a loop, and each reconnect strands another gamepad
+client on the selkies sockets — the symptom being a live picture with a dead
+controller. A request arriving with the current token in the query but the
+superseded one in its cookie is re-cookied, moving the tab across before the
+window closes.
 
 **The gate is only as good as `BROKER_SECRET`.** `POST /launch` is what mints the
 token, and with no secret set the broker accepts that call from anyone — so
@@ -248,11 +296,17 @@ gate. Set the secret, and keep port 8000 off the network the way the compose
 example does. The broker logs a warning at startup when it is unset.
 
 The injection targets `/defaults/default.conf`, the template the base image's
-`init-nginx` copies over the live vhost on every start, rather than the live
-`/etc/nginx/sites-available/default` alone. The two init scripts sit on separate
-s6 branches with no ordering edge between them, so patching only the live file is
-a race: lose it and that copy silently wipes the gate. The live file is patched
-as well, covering the case where the copy has already happened.
+`init-nginx` copies over the live vhost on every start, as well as the live
+`/etc/nginx/sites-available/default`. Patching both is deliberate: the template
+covers any start where the copy has not happened yet, and the live file covers
+the one where it has. Which of the two is load-bearing depends on the base
+image's dependency graph, and that graph is not ours to pin.
+
+What *is* pinned is that nothing reads either file before the patch runs. Every
+long-running service in the base image — `svc-nginx` and `svc-selkies` included
+— depends on `init-services`, and `init-services` now depends on
+`init-eden-config` (see `init-services/dependencies.d/init-eden-config`). See
+[init ordering](#init-ordering) for why that edge matters more than it looks.
 
 Nothing injected into the config may contain a `#`. When `PASSWORD` is set,
 `init-nginx` runs `sed -i 's/#//g'` over the whole file to uncomment its
@@ -325,6 +379,8 @@ Nintendo Switch games do not support emulator-level save states in Eden. Games s
 Each game launch+exit cycle leaves ~4 dead Unix socket connections in the selkies process (`ss -x | grep selkies_event`). The selkies asyncio event loop does not reliably clean up phase-2 connections from killed Eden instances despite the `wait_for(reader.read(1))` patch. The selkies `finally` block calls `writer.close()` correctly but scheduling is not guaranteed under load.
 
 At ~4 zombies per launch with a default fd limit of ~1024, controllers will stop working after roughly 250 launches without a restart. Restart the container weekly (or before you hit the limit) — a cron job or Docker healthcheck restart policy both work.
+
+Treat the rate above as unverified against current builds. It was measured while the `init-services` ordering edge was missing (see [init ordering](#init-ordering)), so selkies had imported `input_handler.py` before the patch landed and the patch was not actually running. Re-measure with `ss -x | grep selkies_event` before assuming the same restart cadence is still needed.
 
 ## RomM Integration
 
