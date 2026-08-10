@@ -235,6 +235,73 @@ logging.basicConfig(
 )
 log = logging.getLogger("broker")
 
+# Stream gate enforcement. "token" enforces the nginx auth_request gate: a
+# request reaches the desktop only if it carries the session token that
+# POST /launch mints. "off" admits everything.
+#
+# The default is "off" because RomM has no way to send that token yet.
+# rommapp/romm#3211 is merged and is what people are running, and its claim
+# response hands the browser the operator's configured host with nothing
+# appended; the half that carries the token through to the iframe URL is
+# rommapp/romm#3856, still open. Enforcing against a client that cannot
+# possibly comply refuses the document, every asset and the WebSocket upgrade
+# alike, which is a total lockout rather than a gate. Set STREAM_GATE=token
+# once #3856 ships, and see the README's Security section for what running
+# with it off exposes.
+#
+# Declared here rather than beside STREAM_TOKEN_GRACE with the other stream
+# constants because resolving the value can warn, and `log` does not exist
+# that early in the module.
+STREAM_GATE_MODES   = ("off", "token")
+STREAM_GATE_DEFAULT = "off"
+
+
+def _resolve_stream_gate(raw: str) -> str:
+    """Normalize a STREAM_GATE value to one of STREAM_GATE_MODES.
+
+    An unrecognized value resolves to "off" rather than to the current
+    default. That is on purpose and does not track the default: a typo must
+    fail toward a reachable stream, never toward one nobody can open.
+    """
+    mode = (raw or STREAM_GATE_DEFAULT).strip().lower()
+    if mode not in STREAM_GATE_MODES:
+        log.warning(
+            "STREAM_GATE=%r is not one of %s, falling back to 'off', "
+            "so the stream gate will not be enforced",
+            raw,
+            ", ".join(STREAM_GATE_MODES),
+        )
+        return "off"
+    return mode
+
+
+STREAM_GATE = _resolve_stream_gate(os.environ.get("STREAM_GATE", STREAM_GATE_DEFAULT))
+
+
+def _log_stream_gate_mode() -> None:
+    """Announce stream gate enforcement at startup, in both directions.
+
+    The permissive case names what is exposed and how to close it, because an
+    operator should never have to deduce that the desktop is open. The
+    enforcing case says so too, so "is the gate actually on" is answerable
+    from `docker logs pcsx2` alone.
+    """
+    if STREAM_GATE == "token":
+        log.info(
+            "Stream gate enforced: the desktop admits only requests carrying "
+            "the stream token that POST /launch mints"
+        )
+        return
+    log.warning(
+        "STREAM_GATE=off, the stream gate is NOT enforced: anyone who can reach "
+        "port 3000 or 3001 gets the interactive desktop and the ROM library at "
+        "/files, with no credential. This is the default while RomM has no way "
+        "to send the token (rommapp/romm#3856). Set STREAM_GATE=token to close it."
+    )
+
+
+
+
 # Report the forwarded GPU environment at startup. Renderer complaints almost
 # always begin with "my env vars aren't taking effect", and this line answers
 # that question from the broker log without a shell in the container.
@@ -631,7 +698,13 @@ def _verify_stream_decision(
     gets a Set-Cookie so later requests carry stream_sid and the token drops
     out of the URL. A cookie-authed request that is already good gets no
     Set-Cookie back, so nginx does not rewrite it.
+    Under STREAM_GATE=off none of that runs and every request is admitted.
     """
+    if STREAM_GATE == "off":
+        # The switch is off: admit without reading the token. No Set-Cookie
+        # either, because there is no gate for a cookie to satisfy later and
+        # nginx would only rewrite the response for nothing.
+        return 200, None, None
     query = urlparse(original_uri).query
     token = _extract_stream_token(query, cookie_header)
     reason = _check_stream_token(token or "")
