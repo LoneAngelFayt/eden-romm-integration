@@ -34,6 +34,21 @@ FULLSCREEN_DELAY = float(os.environ.get("FULLSCREEN_DELAY", "3.0"))
 # rejected with 413 rather than silently truncated.
 _BODY_MAX_BYTES = 64 * 1024
 
+# Stream token lifetime. The TTL is idle time, not absolute: every admitted
+# request slides it forward, so it only fires on a session nobody is watching.
+# Without it a token minted by /launch stays valid until an explicit release,
+# and a container that loses its RomM side (crash, network partition, a user
+# who just closes the tab) leaves the gate open indefinitely.
+STREAM_TOKEN_TTL   = float(os.environ.get("STREAM_TOKEN_TTL",   "43200.0"))
+# How long the superseded token keeps working after a re-issue. Relaunching
+# into an already-open tab means the browser is still replaying the old
+# stream_sid cookie while RomM navigates the iframe to the new URL; without
+# this window every one of those in-flight requests 403s and the stream client
+# reports a dropped connection and retries in a loop. Each reconnect opens
+# another gamepad client on the selkies sockets, and the controller ends up
+# bound to a stale one — a live picture with a dead pad.
+STREAM_TOKEN_GRACE = float(os.environ.get("STREAM_TOKEN_GRACE", "120.0"))
+
 # SDL controller mappings for the selkies virtual "Microsoft X-Box 360 pad".
 # GUID 000000004d6963726f736f6674205800 is the name-based SDL GUID Eden assigns
 # to this device.  These values are sourced from /defaults/qt-config.ini
@@ -219,6 +234,73 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 log = logging.getLogger("broker")
+
+# Stream gate enforcement. "token" enforces the nginx auth_request gate: a
+# request reaches the desktop only if it carries the session token that
+# POST /launch mints. "off" admits everything.
+#
+# The default is "off" because RomM has no way to send that token yet.
+# rommapp/romm#3211 is merged and is what people are running, and its claim
+# response hands the browser the operator's configured host with nothing
+# appended; the half that carries the token through to the iframe URL is
+# rommapp/romm#3856, still open. Enforcing against a client that cannot
+# possibly comply refuses the document, every asset and the WebSocket upgrade
+# alike, which is a total lockout rather than a gate. Set STREAM_GATE=token
+# once #3856 ships, and see the README's Security section for what running
+# with it off exposes.
+#
+# Declared here rather than beside STREAM_TOKEN_GRACE with the other stream
+# constants because resolving the value can warn, and `log` does not exist
+# that early in the module.
+STREAM_GATE_MODES   = ("off", "token")
+STREAM_GATE_DEFAULT = "off"
+
+
+def _resolve_stream_gate(raw: str) -> str:
+    """Normalize a STREAM_GATE value to one of STREAM_GATE_MODES.
+
+    An unrecognized value resolves to "off" rather than to the current
+    default. That is on purpose and does not track the default: a typo must
+    fail toward a reachable stream, never toward one nobody can open.
+    """
+    mode = (raw or STREAM_GATE_DEFAULT).strip().lower()
+    if mode not in STREAM_GATE_MODES:
+        log.warning(
+            "STREAM_GATE=%r is not one of %s, falling back to 'off', "
+            "so the stream gate will not be enforced",
+            raw,
+            ", ".join(STREAM_GATE_MODES),
+        )
+        return "off"
+    return mode
+
+
+STREAM_GATE = _resolve_stream_gate(os.environ.get("STREAM_GATE", STREAM_GATE_DEFAULT))
+
+
+def _log_stream_gate_mode() -> None:
+    """Announce stream gate enforcement at startup, in both directions.
+
+    The permissive case names what is exposed and how to close it, because an
+    operator should never have to deduce that the desktop is open. The
+    enforcing case says so too, so "is the gate actually on" is answerable
+    from `docker logs pcsx2` alone.
+    """
+    if STREAM_GATE == "token":
+        log.info(
+            "Stream gate enforced: the desktop admits only requests carrying "
+            "the stream token that POST /launch mints"
+        )
+        return
+    log.warning(
+        "STREAM_GATE=off, the stream gate is NOT enforced: anyone who can reach "
+        "port 3000 or 3001 gets the interactive desktop and the ROM library at "
+        "/files, with no credential. This is the default while RomM has no way "
+        "to send the token (rommapp/romm#3856). Set STREAM_GATE=token to close it."
+    )
+
+
+
 
 # Report the forwarded GPU environment at startup. Renderer complaints almost
 # always begin with "my env vars aren't taking effect", and this line answers
@@ -495,8 +577,14 @@ _session: dict = {
     # survives game exit so RomM can still pull after the session ends.
     "save_baseline": None,
     # Random per-session token gating the stream proxy on port 3001. Minted on
-    # /launch, swapped for a cookie by the browser, cleared on release.
-    "stream_token": None,
+    # /launch, swapped for a cookie by the browser, cleared on release. The
+    # expiry is a monotonic deadline refreshed on every admitted request; the
+    # prev_* pair holds the token a re-issue replaced, valid for a short grace
+    # window so an already-open tab is not cut off mid-relaunch.
+    "stream_token":        None,
+    "stream_expires":      0.0,
+    "stream_prev_token":   None,
+    "stream_prev_expires": 0.0,
 }
 
 # ── Stream token ──────────────────────────────────────────────────────────────
@@ -507,28 +595,73 @@ _session: dict = {
 
 
 def _issue_stream_token() -> str:
-    """Mint a fresh stream token and bind it to the current session."""
+    """Mint a fresh stream token and bind it to the current session.
+
+    The token being replaced is demoted rather than dropped: it stays usable
+    for STREAM_TOKEN_GRACE seconds so requests already in flight from an open
+    tab still land. See STREAM_TOKEN_GRACE for why that matters.
+    """
     token = secrets.token_urlsafe(32)
+    now = time.monotonic()
     with _session_lock:
+        previous = _session["stream_token"]
+        if previous:
+            _session["stream_prev_token"] = previous
+            _session["stream_prev_expires"] = now + STREAM_TOKEN_GRACE
         _session["stream_token"] = token
+        _session["stream_expires"] = now + STREAM_TOKEN_TTL
     return token
 
 
-def _check_stream_token(token: str) -> bool:
-    """Constant-time check of token against the live session token."""
+def _check_stream_token(token: str) -> str | None:
+    """Judge token against the live session token, then the superseded one.
+
+    Returns None when the token is good, otherwise a short reason for the log.
+    A hit on the live token slides its expiry forward: the TTL exists to close
+    an abandoned session, not to interrupt someone who is still playing.
+    """
     if not token:
-        return False
+        return "no stream token in the request"
+    now = time.monotonic()
     with _session_lock:
         current = _session["stream_token"]
-    if not current:
-        return False
-    return hmac.compare_digest(token, current)
+        if not current:
+            return "no stream session is open"
+        if hmac.compare_digest(token, current):
+            if now >= _session["stream_expires"]:
+                return "stream token expired after %.0fs idle" % STREAM_TOKEN_TTL
+            _session["stream_expires"] = now + STREAM_TOKEN_TTL
+            return None
+        previous = _session["stream_prev_token"]
+        if previous and hmac.compare_digest(token, previous):
+            if now < _session["stream_prev_expires"]:
+                return None
+            _session["stream_prev_token"] = None
+            _session["stream_prev_expires"] = 0.0
+            return "stream token superseded by a newer launch"
+    return "stream token does not match the open session"
 
 
 def _clear_stream_token() -> None:
     """Drop the stream token so the gate rejects everything until next launch."""
     with _session_lock:
         _session["stream_token"] = None
+        _session["stream_expires"] = 0.0
+        _session["stream_prev_token"] = None
+        _session["stream_prev_expires"] = 0.0
+
+
+def _live_stream_token() -> str | None:
+    """The session token if it is still inside its TTL, else None.
+
+    /status hands this to RomM so a reconnecting client can re-attach without
+    a relaunch. An expired token would only send it into the 403 loop the TTL
+    is there to end, so it is reported as absent.
+    """
+    with _session_lock:
+        if _session["stream_token"] and time.monotonic() < _session["stream_expires"]:
+            return _session["stream_token"]
+    return None
 
 
 def _extract_stream_token(query: str, cookie_header: str | None) -> str | None:
@@ -556,22 +689,34 @@ def _stream_cookie_value(token: str) -> str:
 
 def _verify_stream_decision(
     original_uri: str, cookie_header: str | None
-) -> tuple[int, str | None]:
+) -> tuple[int, str | None, str | None]:
     """Decide an nginx auth_request subrequest for the stream gate.
 
-    Returns (status, set_cookie). 200 admits the request, 403 rejects it. When
-    the token arrives in the query (the first iframe load), the caller gets a
-    Set-Cookie so later requests carry stream_sid and the token drops out of the
-    URL. A cookie-authed request that is already good gets no Set-Cookie back,
-    so nginx does not rewrite it.
+    Returns (status, set_cookie, reason). 200 admits the request, 403 rejects
+    it and carries the reason so the refusal is legible in the container log.
+    When the token arrives in the query (the first iframe load), the caller
+    gets a Set-Cookie so later requests carry stream_sid and the token drops
+    out of the URL. A cookie-authed request that is already good gets no
+    Set-Cookie back, so nginx does not rewrite it.
+    Under STREAM_GATE=off none of that runs and every request is admitted.
     """
+    if STREAM_GATE == "off":
+        # The switch is off: admit without reading the token. No Set-Cookie
+        # either, because there is no gate for a cookie to satisfy later and
+        # nginx would only rewrite the response for nothing.
+        return 200, None, None
     query = urlparse(original_uri).query
     token = _extract_stream_token(query, cookie_header)
-    if not _check_stream_token(token or ""):
-        return 403, None
+    reason = _check_stream_token(token or "")
+    if reason:
+        return 403, None, reason
     if "stream_token" in parse_qs(query):
-        return 200, _stream_cookie_value(token)
-    return 200, None
+        # Re-cookie on the query bootstrap, and also when the query token is
+        # the current one but the cookie still holds the superseded token:
+        # the browser must be moved onto the new value before the grace
+        # window closes, or the tab drops out the moment it does.
+        return 200, _stream_cookie_value(token), None
+    return 200, None, None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -1307,12 +1452,19 @@ class BrokerHandler(BaseHTTPRequestHandler):
         # real request URI (carrying the stream_token query on first load) via
         # X-Original-URI and the browser Cookie header; the broker returns 200
         # to admit or 403 to reject, and a Set-Cookie on the query bootstrap.
-        status, set_cookie = _verify_stream_decision(
+        status, set_cookie, reason = _verify_stream_decision(
             self.headers.get("X-Original-URI", ""),
             self.headers.get("Cookie"),
         )
         headers = {"Set-Cookie": set_cookie} if set_cookie else None
-        self._send_json(status, {"ok": status == 200}, headers)
+        body = {"ok": status == 200}
+        if status != 200:
+            body["error"] = reason or "stream request rejected"
+            # Response bodies are logged at DEBUG, and a stream that will not
+            # load is exactly the moment an operator needs the reason without
+            # first raising the log level.
+            log.info("Stream gate refused a request: %s", body["error"])
+        self._send_json(status, body, headers)
 
     def _send_json(self, code: int, body: dict, headers: dict | None = None) -> None:
         payload = json.dumps(body).encode()
@@ -1435,8 +1587,10 @@ class BrokerHandler(BaseHTTPRequestHandler):
                 rom_path     = _session["rom_path"]     if active else None
                 rom_name     = _session["rom_name"]     if active else None
                 started_at   = _session["started_at"]   if active else None
-                stream_token = _session["stream_token"] if active else None
                 abandoned    = _session["relaunch_abandoned"]
+            # Outside the lock: _live_stream_token takes it too, and this one
+            # is not reentrant.
+            stream_token = _live_stream_token() if active else None
             self._send_json(200, {
                 "active":     active,
                 "rom_path":   rom_path,

@@ -146,7 +146,7 @@ def test_save_and_exit_does_not_revoke_the_token_when_it_is_refused(client, rom_
         broker._session["rom_path"] = str(rom(rom_root, "switch/game.nsp"))
         broker._session["launch_in_progress"] = True
     assert request(base, "/save-and-exit", "POST", {"wait": True})[0] == 409
-    assert broker._check_stream_token(token) is True
+    assert broker._check_stream_token(token) is None
 
 
 def test_a_rejected_launch_does_not_leave_the_claim_held(client, rom_root):
