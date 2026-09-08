@@ -4,6 +4,42 @@ A [linuxserver Docker mod](https://docs.linuxserver.io/general/container-customi
 
 Launch Switch games from the RomM web UI and stream them in the browser. Controller input works via selkies, volume is adjustable, and games open fullscreen automatically.
 
+## Migrating to webstation (v2)
+
+This per-emulator broker mod is deprecated in favor of [docker-webstation](https://github.com/linuxserver/docker-webstation) running [romm-broker](https://github.com/romm-streaming/romm-broker). It keeps working today, but it won't get new features, and RomM will eventually drop support for the per-emulator broker shape entirely.
+
+Why: one container serving every platform RomM streams from, running one broker implementation, instead of one container (and one broker fork) per emulator, each drifting slightly.
+
+Before, a dedicated Eden container in `config.yml`:
+
+```yaml
+streaming:
+  containers:
+    - platform: switch
+      host: https://192.168.1.53:3001
+      broker_host: http://192.168.1.53:8000
+      label: Eden
+```
+
+After, Switch is one entry in a webstation container's `platforms:` map (no `memory_card_sync`, Switch has no memory card):
+
+```yaml
+streaming:
+  containers:
+    - host: https://192.168.1.56:3010
+      protocol: webstation
+      subfolder: /streaming
+      library_path: /romm
+      label: Emulation station
+      platforms:
+        switch:
+          emulator: eden
+          label: Eden
+```
+
+See RomM's `docs/STREAMING_MIGRATION.md` for the full guide:
+[https://github.com/rommapp/romm/blob/master/docs/STREAMING_MIGRATION.md](https://github.com/rommapp/romm/blob/master/docs/STREAMING_MIGRATION.md)
+
 ## Features
 
 - Launch Switch ROMs on demand from RomM
